@@ -392,8 +392,149 @@ async function clearPixverseWebStorage() {
   log(`Web storage cleared: ls=${totals.ls} ss=${totals.ss} idb=${totals.idb} sw=${totals.sw} caches=${totals.caches}`);
 }
 
+// Wait for a tab's loading status to reach 'complete'.
+async function waitForTabComplete(tabId, timeoutMs) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      if (tab.status === "complete") return tab;
+    } catch (e) { return null; }
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  return null;
+}
+
+// Self-contained UI-logout function that runs inside the page via
+// chrome.scripting.executeScript. We inject this directly instead of
+// messaging the content script to avoid the "Receiving end does not exist"
+// race when the SPA is mid-navigation.
+async function pageWideUiLogout() {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  function isVisible(el) {
+    if (!el || !el.isConnected) return false;
+    const r = el.getBoundingClientRect();
+    if (r.width < 2 || r.height < 2) return false;
+    const cs = getComputedStyle(el);
+    return cs.visibility !== "hidden" && cs.display !== "none" && cs.opacity !== "0";
+  }
+
+  function findLogoutBtn() {
+    const re = /^(abmelden|ausloggen|sign\s*out|log\s*out|logout|abmeldung)$/i;
+    const els = document.querySelectorAll("*");
+    for (const el of els) {
+      if (!isVisible(el)) continue;
+      const txt = (el.innerText || el.textContent || "").trim();
+      if (!txt || txt.length > 30) continue;
+      if (!re.test(txt)) continue;
+      let cur = el;
+      for (let i = 0; i < 5 && cur; i++) {
+        const role = cur.getAttribute && cur.getAttribute("role");
+        if (cur.tagName === "BUTTON" || cur.tagName === "A" ||
+            role === "button" || role === "menuitem") return cur;
+        cur = cur.parentElement;
+      }
+      return el;
+    }
+    return null;
+  }
+
+  function clickFull(el) {
+    const r = el.getBoundingClientRect();
+    const cx = r.left + r.width / 2;
+    const cy = r.top + r.height / 2;
+    const opts = { bubbles: true, cancelable: true, composed: true,
+      view: window, clientX: cx, clientY: cy, button: 0,
+      pointerType: "mouse", isPrimary: true };
+    try {
+      el.dispatchEvent(new PointerEvent("pointerover", opts));
+      el.dispatchEvent(new MouseEvent("mouseover", opts));
+      el.dispatchEvent(new PointerEvent("pointerenter", opts));
+      el.dispatchEvent(new MouseEvent("mouseenter", opts));
+      el.dispatchEvent(new PointerEvent("pointerdown", opts));
+      el.dispatchEvent(new MouseEvent("mousedown", opts));
+      el.dispatchEvent(new PointerEvent("pointerup", opts));
+      el.dispatchEvent(new MouseEvent("mouseup", opts));
+      el.dispatchEvent(new MouseEvent("click", opts));
+    } catch (_) {}
+    try { el.click && el.click(); } catch (_) {}
+  }
+
+  // Wait up to 10 s for SPA hydration.
+  const tStart = Date.now();
+  while (Date.now() - tStart < 10000) {
+    const n = document.querySelectorAll(
+      "button, a, [role='button'], [aria-haspopup], img"
+    ).length;
+    if (n > 5) break;
+    await sleep(300);
+  }
+
+  // 0) Already-visible logout?
+  let logoutBtn = findLogoutBtn();
+  if (logoutBtn) {
+    clickFull(logoutBtn);
+    return { success: true, method: "direct",
+      text: (logoutBtn.innerText || "").trim().slice(0, 40) };
+  }
+
+  // 1) Try every interactive element in the top-right of the viewport,
+  //    prioritising those carrying aria-haspopup (Ant Design / Base UI use
+  //    that for dropdown triggers).
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  const all = Array.from(document.querySelectorAll(
+    "button, a, [role='button'], img, [aria-haspopup], [class*='avatar' i], [class*='profile' i], [class*='user' i]"
+  ));
+  const cands = [];
+  for (const el of all) {
+    if (!isVisible(el)) continue;
+    const r = el.getBoundingClientRect();
+    if (r.top > vh * 0.25) continue;
+    if (r.right < vw * 0.5) continue;
+    if (r.width > vw * 0.5) continue;
+    cands.push(el);
+  }
+  cands.sort((a, b) => {
+    const aHas = !!(a.matches && (a.matches("[aria-haspopup]") || a.closest("[aria-haspopup]")));
+    const bHas = !!(b.matches && (b.matches("[aria-haspopup]") || b.closest("[aria-haspopup]")));
+    if (aHas !== bHas) return bHas ? 1 : -1;
+    return b.getBoundingClientRect().right - a.getBoundingClientRect().right;
+  });
+
+  const tried = [];
+  for (const el of cands) {
+    const r = el.getBoundingClientRect();
+    tried.push(`${el.tagName}@${r.right | 0},${r.top | 0}`);
+
+    clickFull(el);
+    await sleep(550);
+
+    logoutBtn = findLogoutBtn();
+    if (logoutBtn) {
+      clickFull(logoutBtn);
+      return { success: true, method: "menu",
+        text: (logoutBtn.innerText || "").trim().slice(0, 40),
+        triggerTag: el.tagName };
+    }
+    try {
+      document.body.dispatchEvent(new KeyboardEvent("keydown",
+        { key: "Escape", code: "Escape", bubbles: true }));
+      document.body.dispatchEvent(new KeyboardEvent("keyup",
+        { key: "Escape", code: "Escape", bubbles: true }));
+    } catch (_) {}
+    await sleep(150);
+  }
+
+  return { success: false, reason: "no logout button found",
+    triedCount: tried.length, tried: tried.slice(0, 12) };
+}
+
 // Try to log the user out via the SPA's own profile-menu -> Abmelden flow.
-// Returns true if the click chain actually succeeded.
+// Injects pageWideUiLogout via chrome.scripting.executeScript so it works
+// regardless of the content script's state. Returns true if the click chain
+// actually succeeded.
 async function tryUiLogout() {
   const tabs = await chrome.tabs.query({ url: "https://app.pixverse.ai/*" });
   if (!tabs.length) {
@@ -401,19 +542,30 @@ async function tryUiLogout() {
     return false;
   }
   for (const t of tabs) {
+    if (/\/(register|verify|login)/.test(t.url || "")) {
+      log(`UI logout: tab ${t.id} on auth page (${t.url}), skipping`);
+      continue;
+    }
+    const ready = await waitForTabComplete(t.id, 7000);
+    if (!ready) {
+      log(`UI logout: tab ${t.id} not 'complete' in time`);
+      continue;
+    }
     try {
-      const res = await chrome.tabs.sendMessage(t.id, { type: "PV_UI_LOGOUT" });
-      if (res && res.ok && res.success) {
-        log(`UI logout: success via tab ${t.id}`);
-        // Give the SPA a moment to process its own logout (may navigate to
-        // /login or /register on its own).
-        await new Promise((r) => setTimeout(r, 2200));
+      const results = await chrome.scripting.executeScript({
+        target: { tabId: t.id },
+        func: pageWideUiLogout,
+      });
+      const r = (results && results[0] && results[0].result) || {};
+      if (r.success) {
+        log(`UI logout: success on tab ${t.id} - clicked "${r.text}" (method=${r.method}, trigger=${r.triggerTag || "n/a"})`);
+        await new Promise((res) => setTimeout(res, 2500));
         return true;
       } else {
-        log(`UI logout: no logout button on tab ${t.id}`);
+        log(`UI logout: failed on tab ${t.id} - ${r.reason || "unknown"}, tried=${r.triedCount || 0}: ${(r.tried || []).join(",")}`);
       }
     } catch (e) {
-      log(`UI logout: tab ${t.id} unreachable: ${e.message}`);
+      log(`UI logout: scripting on tab ${t.id} failed: ${e.message}`);
     }
   }
   return false;
