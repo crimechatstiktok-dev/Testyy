@@ -26,6 +26,7 @@ header h1 { font-size: 14px; margin: 0; font-weight: 600; }
   letter-spacing: 0.3px;
 }
 .pill.idle { background: #6b7280; }
+.pill.logging-out { background: #7c3aed; }
 .pill.creating-mailbox,
 .pill.mailbox-ready,
 .pill.filling-form,

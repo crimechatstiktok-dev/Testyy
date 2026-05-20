@@ -196,6 +196,21 @@ async function startRun(opts = {}) {
     log(`Run started (continuation, iteration ${(await currentIter()) + 1})`);
   }
   await chrome.storage.local.set({ [STATE_KEYS.RUN_ACTIVE]: true });
+
+  // Wipe any previous per-iteration state BEFORE we navigate, otherwise the
+  // content-script boot block would race-trigger fillForm() with the stale
+  // pv_account from the previous iteration.
+  await chrome.storage.local.remove([
+    STATE_KEYS.ACCOUNT,
+    STATE_KEYS.MAIL_TOKEN,
+    "pv_verification",
+  ]);
+
+  // Always start each run from a clean, logged-out /register page. This also
+  // covers the very first run when the user happens to already be logged in.
+  await setStatus("logging-out");
+  const tab = await forceLogoutAndOpenRegister();
+
   await setStatus("creating-mailbox");
 
   let mailbox;
@@ -230,9 +245,8 @@ async function startRun(opts = {}) {
   await chrome.alarms.clear("pv-inbox-poll");
   await chrome.alarms.create("pv-inbox-poll", { periodInMinutes: 0.1 }); // every 6s
 
-  // Tell the active tab (or open one) to start filling the form.
-  let tab = await getOrCreatePixverseRegisterTab();
-  // give the content script a moment in case the tab was just created
+  // The tab is already on /register from forceLogoutAndOpenRegister.
+  // Give the content script a small grace period after re-injection.
   await new Promise((r) => setTimeout(r, 600));
   try {
     await chrome.tabs.sendMessage(tab.id, { type: "PV_FILL_FORM", account });
@@ -290,54 +304,73 @@ async function clearPixverseCookies() {
   log(`Cleared ${removed} cookies for pixverse.ai`);
 }
 
-async function prepareNextRun() {
-  const s = await getState();
-  if (!s[STATE_KEYS.RUN_ACTIVE]) {
-    log("Run was stopped externally, not starting next iteration");
-    return;
+// Clears localStorage / sessionStorage / IndexedDB on every open pixverse tab
+// using chrome.scripting.executeScript. Cookie-only logout is not enough
+// because PixVerse keeps its JWT in web storage too.
+async function clearPixverseWebStorage() {
+  const tabs = await chrome.tabs.query({ url: "https://app.pixverse.ai/*" });
+  for (const t of tabs) {
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId: t.id },
+        func: () => {
+          try { localStorage.clear(); } catch (_) {}
+          try { sessionStorage.clear(); } catch (_) {}
+          try {
+            if (indexedDB && typeof indexedDB.databases === "function") {
+              indexedDB.databases().then((dbs) => {
+                for (const db of dbs || []) {
+                  try { indexedDB.deleteDatabase(db.name); } catch (_) {}
+                }
+              }).catch(() => {});
+            }
+          } catch (_) {}
+        },
+      });
+    } catch (e) {
+      log(`scripting on tab ${t.id} failed: ${e.message}`);
+    }
   }
+}
 
-  // Purge auth so we land on /register fresh.
+// Wipe all auth surfaces, then navigate (or open) a tab to /register so the
+// SPA reboots completely and lands on the registration form.
+async function forceLogoutAndOpenRegister() {
   await clearPixverseCookies();
+  await clearPixverseWebStorage();
 
-  // Drop per-iteration state but keep repeat counters.
-  await chrome.storage.local.remove([
-    STATE_KEYS.ACCOUNT,
-    STATE_KEYS.MAIL_TOKEN,
-    "pv_verification",
-  ]);
-
-  // Force-navigate the active pixverse tab to /register so the content script
-  // gets a fresh injection.
   const tabs = await chrome.tabs.query({ url: "https://app.pixverse.ai/*" });
   let tab = tabs[0];
   if (!tab) {
-    tab = await chrome.tabs.create({ url: "https://app.pixverse.ai/register", active: true });
+    tab = await chrome.tabs.create({
+      url: "https://app.pixverse.ai/register",
+      active: true,
+    });
   } else {
     await chrome.tabs.update(tab.id, {
       url: "https://app.pixverse.ai/register",
       active: true,
     });
   }
-  // Wait for the navigation to settle before issuing PV_FILL_FORM.
+  // Wait for navigation + content script (re-)injection to settle.
   await new Promise((r) => setTimeout(r, 2500));
-
-  await startRun({ keepCounters: true });
+  return tab;
 }
 
-async function getOrCreatePixverseRegisterTab() {
-  const tabs = await chrome.tabs.query({ url: "https://app.pixverse.ai/*" });
-  if (tabs.length) {
-    const t = tabs[0];
-    // ensure register page
-    if (!/\/register/.test(t.url || "")) {
-      await chrome.tabs.update(t.id, { url: "https://app.pixverse.ai/register", active: true });
-    } else {
-      await chrome.tabs.update(t.id, { active: true });
-    }
-    return t;
+async function prepareNextRun() {
+  const s = await getState();
+  if (!s[STATE_KEYS.RUN_ACTIVE]) {
+    log("Run was stopped externally, not starting next iteration");
+    return;
   }
-  return await chrome.tabs.create({ url: "https://app.pixverse.ai/register", active: true });
+  // Drop per-iteration state. The repeat counters stay intact. startRun
+  // itself will call forceLogoutAndOpenRegister so we don't repeat it here.
+  await chrome.storage.local.remove([
+    STATE_KEYS.ACCOUNT,
+    STATE_KEYS.MAIL_TOKEN,
+    "pv_verification",
+  ]);
+  await startRun({ keepCounters: true });
 }
 
 // -----------------------------------------------------------------------------
