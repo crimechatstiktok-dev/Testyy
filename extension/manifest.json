@@ -31,9 +31,7 @@
   "content_scripts": [
     {
       "matches": [
-        "https://app.pixverse.ai/register*",
-        "https://app.pixverse.ai/verify*",
-        "https://app.pixverse.ai/login*"
+        "https://app.pixverse.ai/*"
       ],
       "js": ["content.js"],
       "run_at": "document_idle",

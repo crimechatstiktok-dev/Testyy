@@ -35,7 +35,10 @@ header h1 { font-size: 14px; margin: 0; font-weight: 600; }
 .pill.waiting-mail,
 .pill.entering-code,
 .pill.opening-link,
-.pill.code-entered { background: #d97706; }
+.pill.code-entered,
+.pill.verification-done,
+.pill.claiming-reward,
+.pill.entering-referral { background: #d97706; }
 .pill.done { background: #059669; }
 .pill.error { background: #dc2626; }
 .pill.verification-received { background: #7c3aed; }
@@ -56,6 +59,18 @@ section h2 { font-size: 12px; margin: 0 0 8px; text-transform: uppercase; color:
 .controls button:hover { background: #f3f4f6; }
 .controls button.primary { background: #2563eb; color: #fff; border-color: #2563eb; }
 .controls button.primary:hover { background: #1d4ed8; }
+
+.referral .row { display: flex; align-items: center; gap: 6px; }
+.referral label { width: 90px; color: #6b7280; font-size: 11px; }
+.referral input {
+  flex: 1; padding: 6px 8px; border: 1px solid #d1d5db; border-radius: 4px;
+  font-family: ui-monospace, monospace; font-size: 12px; text-transform: uppercase;
+}
+.referral button {
+  padding: 6px 10px; border: 1px solid #2563eb; background: #2563eb; color: #fff;
+  border-radius: 4px; font-size: 11px; cursor: pointer;
+}
+.referral button:hover { background: #1d4ed8; }
 
 .account .row {
   display: flex; align-items: center; gap: 6px; margin-bottom: 5px;

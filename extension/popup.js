@@ -36,6 +36,37 @@ async function refresh() {
 document.addEventListener("DOMContentLoaded", () => {
   refresh();
 
+  // Load stored referral code (default Q1XJSEBM).
+  chrome.storage.local.get("pv_referral_code").then((s) => {
+    $("f-referral").value = (s.pv_referral_code || "Q1XJSEBM").toUpperCase();
+  });
+
+  // Persist referral code on each change.
+  $("f-referral").addEventListener("input", (e) => {
+    const v = (e.target.value || "").trim().toUpperCase();
+    e.target.value = v;
+    chrome.storage.local.set({ pv_referral_code: v || "Q1XJSEBM" });
+  });
+
+  // Manual "Claim" trigger (sends a message to the active pixverse tab).
+  $("btn-claim").addEventListener("click", async () => {
+    const tabs = await chrome.tabs.query({ url: "https://app.pixverse.ai/*", active: true, currentWindow: true });
+    let tab = tabs[0];
+    if (!tab) {
+      const all = await chrome.tabs.query({ url: "https://app.pixverse.ai/*" });
+      tab = all[0];
+    }
+    if (!tab) {
+      alert("Kein PixVerse-Tab offen.");
+      return;
+    }
+    try {
+      await chrome.tabs.sendMessage(tab.id, { type: "PV_CLAIM_REFERRAL_NOW" });
+    } catch (e) {
+      alert("Konnte den Tab nicht ansprechen: " + e.message);
+    }
+  });
+
   $("btn-start").addEventListener("click", async () => {
     $("btn-start").disabled = true;
     try {

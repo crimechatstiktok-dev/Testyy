@@ -21,7 +21,10 @@
     formFilled: false,
     continueClicked: false,
     verificationDone: false,
+    rewardClaimed: false,
   };
+
+  const DEFAULT_REFERRAL_CODE = "Q1XJSEBM";
 
   // ---------------------------------------------------------------------------
   // Logging helpers
@@ -284,11 +287,172 @@
     if (confirmBtn && buttonEnabled(confirmBtn)) {
       confirmBtn.click();
       logBg("Confirm button clicked");
-      setStatus("done");
+      setStatus("verification-done");
     } else {
       logBg("No confirm button (maybe auto-submit) - leaving as is");
-      setStatus("done");
+      setStatus("verification-done");
     }
+
+    // Give the app time to land on the dashboard, then claim the referral.
+    setTimeout(() => claimReferralReward(), 3500);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Step 5 - referral reward flow
+  //   1) Click "Credits verdienen" in the navbar
+  //   2) Find "Belohnungen von Freunden" card -> click its Start button
+  //   3) Wait for "Empfehlungscode eingeben" modal -> fill input
+  //   4) Click "Abonnieren" / Confirm
+  // ---------------------------------------------------------------------------
+  function findElementByText(regex, selector) {
+    const list = document.querySelectorAll(selector || "h1,h2,h3,h4,h5,div,span,label,p,a,button");
+    for (const el of list) {
+      if (!isVisible(el)) continue;
+      const txt = (el.innerText || el.textContent || "").trim();
+      if (!txt || txt.length > 200) continue;
+      if (regex.test(txt)) return el;
+    }
+    return null;
+  }
+
+  function findClickableByText(regex) {
+    const list = document.querySelectorAll("button, a, [role='button']");
+    for (const el of list) {
+      if (!isVisible(el)) continue;
+      const txt = (el.innerText || el.textContent || "").trim();
+      if (regex.test(txt)) return el;
+    }
+    return null;
+  }
+
+  async function claimReferralReward() {
+    if (state.rewardClaimed) return;
+    state.rewardClaimed = true;
+    setStatus("claiming-reward");
+    logBg("Reward flow start");
+
+    // Look up referral code (popup-configurable, fallback to Q1XJSEBM).
+    const stored = await chrome.storage.local.get("pv_referral_code");
+    const code = ((stored.pv_referral_code || DEFAULT_REFERRAL_CODE) + "").trim().toUpperCase();
+    if (!code) {
+      logBg("No referral code configured, skipping");
+      setStatus("done");
+      return;
+    }
+    logBg(`Referral code: ${code}`);
+
+    // -------------------------------------------------------------------------
+    // 1) "Credits verdienen" button in navbar
+    // -------------------------------------------------------------------------
+    const earnBtn = await waitFor(
+      () => findClickableByText(/credits verdienen|earn credits|credits earn/i),
+      30000, 500
+    );
+    if (!earnBtn) {
+      logBg("ERROR: 'Credits verdienen' button not found");
+      setStatus("error");
+      return;
+    }
+    earnBtn.click();
+    logBg("Clicked 'Credits verdienen'");
+    await sleep(1500);
+
+    // -------------------------------------------------------------------------
+    // 2) "Belohnungen von Freunden" -> Start button
+    // -------------------------------------------------------------------------
+    const startBtn = await waitFor(() => {
+      const label = findElementByText(
+        /belohnung(en)? von freunden|rewards from friends|invite friends|friend reward/i
+      );
+      if (!label) return null;
+      // Walk up to find a Start/Claim button within the surrounding card.
+      let cur = label;
+      for (let i = 0; i < 8 && cur; i++) {
+        if (cur.querySelectorAll) {
+          const btn = Array.from(cur.querySelectorAll("button, [role='button']"))
+            .find((b) =>
+              /^(start|jetzt starten|claim|einlösen|einloesen|los|go)$/i
+                .test((b.innerText || "").trim()) && isVisible(b)
+            );
+          if (btn) return btn;
+        }
+        cur = cur.parentElement;
+      }
+      return null;
+    }, 30000, 500);
+
+    if (!startBtn) {
+      logBg("ERROR: 'Belohnungen von Freunden' Start button not found");
+      setStatus("error");
+      return;
+    }
+    startBtn.click();
+    logBg("Clicked Start on 'Belohnungen von Freunden'");
+    await sleep(1200);
+
+    // -------------------------------------------------------------------------
+    // 3) Modal opens -> find input near "Empfehlungscode" / "Referral code"
+    // -------------------------------------------------------------------------
+    setStatus("entering-referral");
+    const inp = await waitFor(() => {
+      const label = findElementByText(
+        /empfehlungscode|referral code|invite code|werber/i
+      );
+      if (label) {
+        let cur = label;
+        for (let i = 0; i < 8 && cur; i++) {
+          if (cur.querySelector) {
+            const found = cur.querySelector(
+              "input[type='text'], input:not([type]), input[type='search']"
+            );
+            if (found && isVisible(found) && !found.readOnly) return found;
+          }
+          cur = cur.parentElement;
+        }
+      }
+      // Fallback: a single visible empty text input on the page (modal case).
+      const inputs = visibleInputs().filter((i) => !i.value);
+      if (inputs.length === 1) return inputs[0];
+      return null;
+    }, 15000, 300);
+
+    if (!inp) {
+      logBg("ERROR: referral code input not found");
+      setStatus("error");
+      return;
+    }
+    inp.focus();
+    setReactInputValue(inp, code);
+    await sleep(400);
+    inp.blur();
+    logBg(`Referral code entered: ${code}`);
+    await sleep(700);
+
+    // -------------------------------------------------------------------------
+    // 4) Submit button: "Abonnieren" (per Screenshot) - or common variants.
+    // -------------------------------------------------------------------------
+    const submitBtn = await waitFor(() => {
+      const btns = Array.from(document.querySelectorAll("button, [role='button']"));
+      return btns.find((b) =>
+        /^(abonnieren|bestätigen|bestaetigen|confirm|submit|einlösen|einloesen|claim|ok|absenden|senden)$/i
+          .test((b.innerText || "").trim()) &&
+        isVisible(b) && buttonEnabled(b)
+      );
+    }, 8000, 300);
+
+    if (submitBtn) {
+      submitBtn.click();
+      logBg("Submit button clicked (referral)");
+    } else {
+      logBg("WARN: submit button not found, trying Enter key");
+      inp.dispatchEvent(new KeyboardEvent("keydown",
+        { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true }));
+      inp.dispatchEvent(new KeyboardEvent("keypress",
+        { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true }));
+    }
+
+    setStatus("done");
+    logBg("Reward flow complete");
   }
 
   // ---------------------------------------------------------------------------
@@ -320,6 +484,10 @@
         } else if (msg.type === "PV_VERIFICATION") {
           await applyVerification(msg);
           sendResponse({ ok: true });
+        } else if (msg.type === "PV_CLAIM_REFERRAL_NOW") {
+          state.rewardClaimed = false;  // allow manual re-trigger
+          claimReferralReward();
+          sendResponse({ ok: true });
         } else if (msg.type === "PV_PING") {
           sendResponse({ ok: true, url: location.href });
         } else {
@@ -340,15 +508,25 @@
     try {
       const r = await chrome.runtime.sendMessage({ type: "PV_GET_STATE" });
       if (r && r.ok && r.state && r.state.pv_run_active && r.state.pv_account) {
-        logBg(`Content loaded - run active, url=${location.pathname}`);
+        const status = r.state.pv_status || "";
+        logBg(`Content loaded - run active, url=${location.pathname}, status=${status}`);
         // If we're back on /register and form not yet filled this session, fill it.
         if (/\/register/.test(location.pathname) && !state.formFilled) {
           // small grace period for app shell hydration
           setTimeout(() => fillForm(r.state.pv_account), 1500);
         }
         // If we land on /verify and there is already a verification stored, apply it.
-        if (/\/verify/.test(location.pathname) && r.state.pv_verification) {
+        else if (/\/verify/.test(location.pathname) && r.state.pv_verification) {
           setTimeout(() => applyVerification(r.state.pv_verification), 1500);
+        }
+        // If verification already done but reward not yet claimed and we're
+        // on a dashboard/main app page, trigger the reward flow.
+        else if (
+          !/\/(register|verify|login)/.test(location.pathname) &&
+          ["verification-done", "claiming-reward", "entering-referral", "code-entered"]
+            .includes(status)
+        ) {
+          setTimeout(() => claimReferralReward(), 2500);
         }
       }
     } catch (e) { /* ignore */ }
