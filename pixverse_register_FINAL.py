@@ -395,19 +395,25 @@ async def main():
     }
     
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=False,
-            args=[
-                '--disable-blink-features=AutomationControlled',
-                '--disable-features=IsolateOrigins,site-per-process',
-                '--no-sandbox',
-                '--disable-dev-shm-usage',
-                f'--window-size={FINGERPRINT["outerSize"]["width"]},{FINGERPRINT["outerSize"]["height"]}',
-            ]
-        )
+        # =====================================================================
+        # ECHTES CHROME verwenden (nicht Test-Chromium!)
+        # =====================================================================
+        # - channel="chrome" nutzt dein installiertes Google Chrome
+        # - user_data_dir = eigener Profilordner (dein Chrome bleibt offen!)
+        # - Cookies bleiben zwischen Runs erhalten -> Cloudflare vertraut dem Browser
+        # =====================================================================
         
-        # Context mit allen Fingerprint-Werten
-        context = await browser.new_context(
+        import os
+        profile_dir = os.path.abspath("./pixverse_chrome_profile")
+        os.makedirs(profile_dir, exist_ok=True)
+        print(f"\n[BROWSER] Echtes Chrome mit Profil: {profile_dir}")
+        
+        # launch_persistent_context startet Chrome mit eigenem Profil
+        # Dein normales Chrome bleibt offen, dieses ist ein separates!
+        context = await p.chromium.launch_persistent_context(
+            user_data_dir=profile_dir,
+            channel="chrome",  # WICHTIG: Echtes Chrome statt Test-Chromium!
+            headless=False,
             viewport={
                 "width": FINGERPRINT["viewport"]["width"],
                 "height": FINGERPRINT["viewport"]["height"]
@@ -426,13 +432,28 @@ async def main():
                 "sec-ch-ua": FINGERPRINT["secChUa"],
                 "sec-ch-ua-mobile": FINGERPRINT["secChUaMobile"],
                 "sec-ch-ua-platform": FINGERPRINT["secChUaPlatform"],
-            }
+            },
+            args=[
+                '--disable-blink-features=AutomationControlled',
+                '--disable-features=IsolateOrigins,site-per-process',
+                '--no-default-browser-check',
+                '--no-first-run',
+                f'--window-size={FINGERPRINT["outerSize"]["width"]},{FINGERPRINT["outerSize"]["height"]}',
+            ],
+            ignore_default_args=[
+                '--enable-automation',  # Versteckt "Chrome wird von Software gesteuert" Banner
+            ]
         )
+        browser = context.browser  # Für späteres close()
         
         # Anti-Detection vor jeder Seite injizieren
         await context.add_init_script(ANTI_DETECTION_SCRIPT)
         
-        page = await context.new_page()
+        # Erste Seite holen (kommt automatisch mit launch_persistent_context)
+        if context.pages:
+            page = context.pages[0]
+        else:
+            page = await context.new_page()
         
         try:
             print("\n[2] Öffne PixVerse Register...")
