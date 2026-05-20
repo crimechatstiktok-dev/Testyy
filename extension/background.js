@@ -392,13 +392,44 @@ async function clearPixverseWebStorage() {
   log(`Web storage cleared: ls=${totals.ls} ss=${totals.ss} idb=${totals.idb} sw=${totals.sw} caches=${totals.caches}`);
 }
 
+// Try to log the user out via the SPA's own profile-menu -> Abmelden flow.
+// Returns true if the click chain actually succeeded.
+async function tryUiLogout() {
+  const tabs = await chrome.tabs.query({ url: "https://app.pixverse.ai/*" });
+  if (!tabs.length) {
+    log("UI logout: no pixverse tab open");
+    return false;
+  }
+  for (const t of tabs) {
+    try {
+      const res = await chrome.tabs.sendMessage(t.id, { type: "PV_UI_LOGOUT" });
+      if (res && res.ok && res.success) {
+        log(`UI logout: success via tab ${t.id}`);
+        // Give the SPA a moment to process its own logout (may navigate to
+        // /login or /register on its own).
+        await new Promise((r) => setTimeout(r, 2200));
+        return true;
+      } else {
+        log(`UI logout: no logout button on tab ${t.id}`);
+      }
+    } catch (e) {
+      log(`UI logout: tab ${t.id} unreachable: ${e.message}`);
+    }
+  }
+  return false;
+}
+
 // Wipe all auth surfaces, then navigate (or open) a tab to /register so the
 // SPA reboots completely and lands on the registration form.
 async function forceLogoutAndOpenRegister() {
-  // 1) Clear web storage WHILE we're still on a pixverse origin (so the
-  //    same-origin restrictions of localStorage/IndexedDB are satisfied).
+  // 1) Try the in-app logout button first - it's the most reliable way
+  //    because the SPA's own logout code clears whatever it set.
+  const uiOk = await tryUiLogout();
+
+  // 2) Belt-and-braces: even after a successful UI logout we still wipe
+  //    web storage + cookies. If the UI click failed entirely (e.g. user
+  //    was already on /register), this is the only line of defence.
   await clearPixverseWebStorage();
-  // 2) Cookies (chrome.cookies API doesn't care about the active tab).
   await clearPixverseCookies();
 
   // 3) Hop to about:blank first to evict any cached SPA state, then to
@@ -417,6 +448,7 @@ async function forceLogoutAndOpenRegister() {
   await chrome.tabs.update(tab.id, { url: "https://app.pixverse.ai/register" });
   // Wait for navigation + content script (re-)injection to settle.
   await new Promise((r) => setTimeout(r, 2800));
+  log(`forceLogoutAndOpenRegister done (uiLogout=${uiOk ? "ok" : "skipped"})`);
   return tab;
 }
 

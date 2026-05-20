@@ -570,6 +570,160 @@
   }
 
   // ---------------------------------------------------------------------------
+  // UI logout: hover the avatar/profile menu in the navbar, click "Abmelden".
+  // This is more reliable than clearing cookies + storage from the outside,
+  // because the SPA itself runs its real logout flow (clearing whatever
+  // tokens it set, in whichever store).
+  // ---------------------------------------------------------------------------
+  function findLogoutClickable() {
+    const re = /^(abmelden|ausloggen|sign\s*out|log\s*out|logout|abmeldung)$/i;
+    // Search anything visible whose own text matches.
+    const all = document.querySelectorAll("*");
+    for (const el of all) {
+      if (!isVisible(el)) continue;
+      const txt = (el.innerText || el.textContent || "").trim();
+      if (!txt || txt.length > 30) continue;
+      if (!re.test(txt)) continue;
+      // Walk up to a clickable container (button/link/role=button) but no
+      // higher than 5 levels.
+      let cur = el;
+      for (let i = 0; i < 5 && cur; i++) {
+        const role = cur.getAttribute && cur.getAttribute("role");
+        if (
+          cur.tagName === "BUTTON" ||
+          cur.tagName === "A" ||
+          role === "button" ||
+          role === "menuitem"
+        ) {
+          return cur;
+        }
+        cur = cur.parentElement;
+      }
+      return el;
+    }
+    return null;
+  }
+
+  // Try every interactive element in the top-right of the page until the
+  // logout entry shows up.
+  async function openProfileMenuAndLogout() {
+    const logoutBefore = findLogoutClickable();
+    if (logoutBefore) {
+      logBg("Logout button already visible -> click directly");
+      logoutBefore.click();
+      return true;
+    }
+
+    // Profile menu is in the top-right corner of the navbar. Build a list
+    // of candidate triggers sorted right-most, top-most first.
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    const all = document.querySelectorAll(
+      "img, button, a, [role='button'], [class*='avatar' i], [class*='profile' i], [class*='user' i], [class*='menu' i]"
+    );
+    const cands = [];
+    for (const el of all) {
+      if (!isVisible(el)) continue;
+      const r = el.getBoundingClientRect();
+      // top 25% of viewport, right 50%
+      if (r.top > vh * 0.25) continue;
+      if (r.right < vw * 0.5) continue;
+      // Skip the giant page-wide nav bar itself (we only want small icons)
+      if (r.width > vw * 0.5) continue;
+      cands.push(el);
+    }
+    cands.sort((a, b) => {
+      const ra = a.getBoundingClientRect();
+      const rb = b.getBoundingClientRect();
+      return rb.right - ra.right; // rightmost first
+    });
+
+    logBg(`uiLogout: trying ${cands.length} top-right candidates`);
+
+    for (const el of cands) {
+      const r = el.getBoundingClientRect();
+      const cx = r.left + r.width / 2;
+      const cy = r.top + r.height / 2;
+      const evtOpts = {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        view: window,
+        clientX: cx,
+        clientY: cy,
+        button: 0,
+        pointerType: "mouse",
+        isPrimary: true,
+      };
+      try {
+        // Hover (some apps open menu purely on hover)
+        el.dispatchEvent(new PointerEvent("pointerover", evtOpts));
+        el.dispatchEvent(new PointerEvent("pointerenter", evtOpts));
+        el.dispatchEvent(new MouseEvent("mouseover", evtOpts));
+        el.dispatchEvent(new MouseEvent("mouseenter", evtOpts));
+      } catch (_) {}
+      // Then click - many apps require a click to pin the menu
+      try {
+        el.dispatchEvent(new PointerEvent("pointerdown", evtOpts));
+        el.dispatchEvent(new MouseEvent("mousedown", evtOpts));
+        el.dispatchEvent(new PointerEvent("pointerup", evtOpts));
+        el.dispatchEvent(new MouseEvent("mouseup", evtOpts));
+        el.dispatchEvent(new MouseEvent("click", evtOpts));
+        el.click && el.click();
+      } catch (_) {}
+
+      await sleep(450);
+
+      const logoutBtn = findLogoutClickable();
+      if (logoutBtn) {
+        logBg(`Profile menu opened via candidate (right=${r.right | 0}, top=${r.top | 0})`);
+        // Click the logout entry (full event sequence again).
+        const lr = logoutBtn.getBoundingClientRect();
+        const lcx = lr.left + lr.width / 2;
+        const lcy = lr.top + lr.height / 2;
+        const lopts = { ...evtOpts, clientX: lcx, clientY: lcy };
+        try {
+          logoutBtn.dispatchEvent(new PointerEvent("pointerover", lopts));
+          logoutBtn.dispatchEvent(new MouseEvent("mouseover", lopts));
+          logoutBtn.dispatchEvent(new PointerEvent("pointerdown", lopts));
+          logoutBtn.dispatchEvent(new MouseEvent("mousedown", lopts));
+          logoutBtn.dispatchEvent(new PointerEvent("pointerup", lopts));
+          logoutBtn.dispatchEvent(new MouseEvent("mouseup", lopts));
+          logoutBtn.dispatchEvent(new MouseEvent("click", lopts));
+          logoutBtn.click && logoutBtn.click();
+        } catch (_) {}
+        logBg(`Clicked logout: text="${(logoutBtn.innerText || "").trim()}"`);
+        return true;
+      }
+
+      // Close any menu that may have opened (Esc) before trying the next
+      // candidate, otherwise multiple menus could overlap.
+      try {
+        document.body.dispatchEvent(new KeyboardEvent("keydown",
+          { key: "Escape", code: "Escape", bubbles: true }));
+      } catch (_) {}
+      await sleep(150);
+    }
+
+    logBg("uiLogout: no logout entry found via any candidate");
+    return false;
+  }
+
+  async function uiLogout() {
+    // Skip immediately on auth pages - there is no profile menu there.
+    if (/\/(register|verify|login)/.test(location.pathname)) {
+      logBg("uiLogout: on auth page, skipping");
+      return false;
+    }
+    try {
+      return await openProfileMenuAndLogout();
+    } catch (e) {
+      logBg(`uiLogout error: ${e.message}`);
+      return false;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
   // Message handler from background
   // ---------------------------------------------------------------------------
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -585,6 +739,9 @@
           state.rewardClaimed = false;  // allow manual re-trigger
           claimReferralReward();
           sendResponse({ ok: true });
+        } else if (msg.type === "PV_UI_LOGOUT") {
+          const success = await uiLogout();
+          sendResponse({ ok: true, success });
         } else if (msg.type === "PV_PING") {
           sendResponse({ ok: true, url: location.href });
         } else {
