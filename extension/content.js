@@ -474,25 +474,71 @@
     await sleep(700);
 
     // -------------------------------------------------------------------------
-    // 4) Submit button: "Abonnieren" (per Screenshot) - or common variants.
+    // 4) Submit button: "Bestaetigen" / "Abonnieren" / common variants.
+    //    Wait up to 25s for the button to become enabled. Some modals are
+    //    taller than the viewport and the button sits below the fold, so we
+    //    scrollIntoView first. We also fire a full pointer/mouse sequence
+    //    instead of just .click() because some React handlers ignore the
+    //    synthetic native click.
     // -------------------------------------------------------------------------
+    const submitRe = /^(abonnieren|bestätigen|bestaetigen|confirm|submit|einlösen|einloesen|claim|ok|absenden|senden|fertig|done)$/i;
+
+    // Build a label-anchored search so we pick the button inside THIS modal
+    // (the referral one), not e.g. a global "Subscribe" in the page chrome.
+    const referralLabelRe = /empfehlungscode|empfehlungs-code|referral code|invite code|werber/i;
+
     const submitBtn = await waitFor(() => {
-      const btns = Array.from(document.querySelectorAll("button, [role='button']"));
-      return btns.find((b) =>
-        /^(abonnieren|bestätigen|bestaetigen|confirm|submit|einlösen|einloesen|claim|ok|absenden|senden)$/i
-          .test((b.innerText || "").trim()) &&
-        isVisible(b) && buttonEnabled(b)
-      );
-    }, 8000, 300);
+      const cand = findClickableNearLabel(referralLabelRe, submitRe);
+      if (!cand) return null;
+      return buttonEnabled(cand) ? cand : null;
+    }, 25000, 300);
 
     if (submitBtn) {
-      submitBtn.click();
-      logBg("Submit button clicked (referral)");
+      try {
+        submitBtn.scrollIntoView({ block: "center", inline: "center" });
+      } catch (_) {}
+      await sleep(250);
+      try { submitBtn.focus(); } catch (_) {}
+
+      const rect = submitBtn.getBoundingClientRect();
+      const cx = rect.left + rect.width / 2;
+      const cy = rect.top + rect.height / 2;
+      const evtOpts = {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        view: window,
+        clientX: cx,
+        clientY: cy,
+        button: 0,
+        buttons: 1,
+        pointerType: "mouse",
+        isPrimary: true,
+      };
+      try {
+        submitBtn.dispatchEvent(new PointerEvent("pointerover", evtOpts));
+        submitBtn.dispatchEvent(new PointerEvent("pointerenter", evtOpts));
+        submitBtn.dispatchEvent(new MouseEvent("mouseover", evtOpts));
+        submitBtn.dispatchEvent(new PointerEvent("pointerdown", evtOpts));
+        submitBtn.dispatchEvent(new MouseEvent("mousedown", evtOpts));
+        submitBtn.dispatchEvent(new PointerEvent("pointerup", evtOpts));
+        submitBtn.dispatchEvent(new MouseEvent("mouseup", evtOpts));
+        submitBtn.dispatchEvent(new MouseEvent("click", evtOpts));
+      } catch (e) {
+        logBg(`pointer dispatch failed: ${e.message}`);
+      }
+      // Native fallback - covers cases where the framework only listens to
+      // the native click, not synthetic MouseEvents.
+      try { submitBtn.click(); } catch (_) {}
+      logBg(`Submit clicked: text="${(submitBtn.innerText || "").trim()}"`);
     } else {
-      logBg("WARN: submit button not found, trying Enter key");
+      logBg("WARN: submit button not enabled in time, trying Enter key");
+      inp.focus();
       inp.dispatchEvent(new KeyboardEvent("keydown",
         { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true }));
       inp.dispatchEvent(new KeyboardEvent("keypress",
+        { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true }));
+      inp.dispatchEvent(new KeyboardEvent("keyup",
         { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true }));
     }
 
