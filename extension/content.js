@@ -325,6 +325,58 @@
     return null;
   }
 
+  // Find the smallest (deepest) visible element whose own text matches.
+  // We prefer the candidate with the shortest text - that's the leaf.
+  function findDeepestLabel(regex) {
+    const cands = document.querySelectorAll(
+      "h1,h2,h3,h4,h5,h6,div,span,label,p,a,strong,em,b"
+    );
+    let best = null;
+    let bestLen = Infinity;
+    for (const el of cands) {
+      if (!isVisible(el)) continue;
+      const txt = (el.innerText || el.textContent || "").trim();
+      if (!txt || txt.length > 200) continue;
+      if (!regex.test(txt)) continue;
+      if (txt.length < bestLen) { bestLen = txt.length; best = el; }
+    }
+    return best;
+  }
+
+  // Find the clickable element (matching clickRegex) that is closest in DOM
+  // distance to a label matching labelRegex. Distance = (steps from clickable
+  // up to common ancestor) + (steps from label up to common ancestor). This
+  // correctly disambiguates between several "Start" buttons in a list of
+  // reward cards.
+  function findClickableNearLabel(labelRegex, clickRegex) {
+    const label = findDeepestLabel(labelRegex);
+    if (!label) return null;
+
+    const clickables = Array.from(
+      document.querySelectorAll("button, a, [role='button']")
+    ).filter((b) =>
+      isVisible(b) && clickRegex.test((b.innerText || b.textContent || "").trim())
+    );
+    if (!clickables.length) return null;
+
+    // Build map of label ancestors -> depth.
+    const labelAncestors = new Map();
+    let d = 0;
+    for (let n = label; n; n = n.parentElement) { labelAncestors.set(n, d++); }
+
+    let best = null;
+    let bestDist = Infinity;
+    for (const btn of clickables) {
+      let n = btn;
+      let bd = 0;
+      while (n && !labelAncestors.has(n)) { n = n.parentElement; bd++; }
+      if (!n) continue;
+      const total = bd + labelAncestors.get(n);
+      if (total < bestDist) { bestDist = total; best = btn; }
+    }
+    return best;
+  }
+
   async function claimReferralReward() {
     if (state.rewardClaimed) return;
     state.rewardClaimed = true;
@@ -358,28 +410,21 @@
     await sleep(1500);
 
     // -------------------------------------------------------------------------
-    // 2) "Belohnungen von Freunden" -> Start button
+    // 2) "Belohnungen von Freunden" -> Start button (DOM-distance match)
     // -------------------------------------------------------------------------
-    const startBtn = await waitFor(() => {
-      const label = findElementByText(
-        /belohnung(en)? von freunden|rewards from friends|invite friends|friend reward/i
-      );
-      if (!label) return null;
-      // Walk up to find a Start/Claim button within the surrounding card.
-      let cur = label;
-      for (let i = 0; i < 8 && cur; i++) {
-        if (cur.querySelectorAll) {
-          const btn = Array.from(cur.querySelectorAll("button, [role='button']"))
-            .find((b) =>
-              /^(start|jetzt starten|claim|einlösen|einloesen|los|go)$/i
-                .test((b.innerText || "").trim()) && isVisible(b)
-            );
-          if (btn) return btn;
-        }
-        cur = cur.parentElement;
-      }
-      return null;
-    }, 30000, 500);
+    // The reward page lists multiple cards (APP herunterladen, Profil anpassen,
+    // Belohnungen von Freunden ...) all with their own "Start" button. We must
+    // pick the Start button that belongs to the friends-reward card, not just
+    // the first Start in the list. Strategy: find the deepest label element
+    // matching the friends-reward text and pick the Start button that is
+    // closest to it in DOM-distance.
+    const startRe = /^(start|jetzt starten|jetzt|claim|einlösen|einloesen|los|go)$/i;
+    const labelRe = /belohnung(en)? von freunden|rewards from friends|invite friends|friend reward/i;
+
+    const startBtn = await waitFor(
+      () => findClickableNearLabel(labelRe, startRe),
+      30000, 500
+    );
 
     if (!startBtn) {
       logBg("ERROR: 'Belohnungen von Freunden' Start button not found");
@@ -391,33 +436,33 @@
     await sleep(1200);
 
     // -------------------------------------------------------------------------
-    // 3) Modal opens -> find input near "Empfehlungscode" / "Referral code"
+    // 3) Modal opens -> find input near "Empfehlungscode" / "Referral code".
+    //    We REQUIRE the label text to be present (no blind fallback to "any
+    //    visible empty input"), otherwise we might fill a wrong modal (e.g.
+    //    if the previous step accidentally clicked the wrong card's Start).
     // -------------------------------------------------------------------------
     setStatus("entering-referral");
     const inp = await waitFor(() => {
-      const label = findElementByText(
-        /empfehlungscode|referral code|invite code|werber/i
+      const label = findDeepestLabel(
+        /empfehlungscode|empfehlungs-code|referral code|invite code|werber/i
       );
-      if (label) {
-        let cur = label;
-        for (let i = 0; i < 8 && cur; i++) {
-          if (cur.querySelector) {
-            const found = cur.querySelector(
-              "input[type='text'], input:not([type]), input[type='search']"
-            );
-            if (found && isVisible(found) && !found.readOnly) return found;
-          }
-          cur = cur.parentElement;
+      if (!label) return null;
+      // Walk up looking for a text input within the same modal/dialog.
+      let cur = label;
+      for (let i = 0; i < 10 && cur; i++) {
+        if (cur.querySelector) {
+          const found = cur.querySelector(
+            "input[type='text'], input:not([type]), input[type='search']"
+          );
+          if (found && isVisible(found) && !found.readOnly) return found;
         }
+        cur = cur.parentElement;
       }
-      // Fallback: a single visible empty text input on the page (modal case).
-      const inputs = visibleInputs().filter((i) => !i.value);
-      if (inputs.length === 1) return inputs[0];
       return null;
     }, 15000, 300);
 
     if (!inp) {
-      logBg("ERROR: referral code input not found");
+      logBg("ERROR: referral code modal/input not found - wrong card opened?");
       setStatus("error");
       return;
     }
