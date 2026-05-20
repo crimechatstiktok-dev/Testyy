@@ -1,0 +1,5 @@
+# PixVerse Scraper Dependencies
+playwright>=1.40.0
+
+# Nach der Installation:
+# playwright install chromium
