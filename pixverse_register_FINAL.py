@@ -1,20 +1,10 @@
 #!/usr/bin/env python3
 """
-PixVerse AI Registrierung - FINALE VERSION für lokale Ausführung
-================================================================
+PixVerse AI Registrierung - MIT ECHTEM BROWSER-FINGERPRINT
+==========================================================
 
-Dieses Skript:
-1. Erstellt eine temporäre E-Mail über mail.tm (kein Cloudflare!)
-2. Öffnet PixVerse Register-Seite
-3. Füllt das Formular automatisch aus
-4. WARTET auf Cloudflare Turnstile (löst sich auf echten Computern AUTOMATISCH!)
-5. Klickt Submit
-6. Wartet auf Verifizierungs-E-Mail über mail.tm API
-7. Extrahiert Code/Link und verifiziert
-
-WICHTIG: Auf einem echten Desktop-Computer löst sich Cloudflare Turnstile 
-automatisch (passive challenge). In Server-Umgebungen wird der Browser als 
-Bot erkannt und blockiert.
+Verwendet den vom User bereitgestellten echten Browser-Fingerprint
+(Chrome 148 auf Windows 10, NVIDIA RTX 3050 Ti) um Cloudflare zu umgehen.
 
 INSTALLATION:
     pip install playwright aiohttp
@@ -34,6 +24,201 @@ from playwright.async_api import async_playwright
 import aiohttp
 
 
+# =====================================================================
+# ECHTER BROWSER-FINGERPRINT (vom User bereitgestellt)
+# =====================================================================
+FINGERPRINT = {
+    "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
+    "platform": "Win32",
+    "language": "de-DE",
+    "languages": ["de-DE", "de", "en-US", "en"],
+    "timezone": "Europe/Berlin",
+    "hardwareConcurrency": 12,
+    "deviceMemory": 32,
+    "vendor": "Google Inc.",
+    "vendorSub": "",
+    "product": "Gecko",
+    "productSub": "20030107",
+    "screen": {
+        "width": 1920,
+        "height": 1080,
+        "availWidth": 1920,
+        "availHeight": 1032,
+        "colorDepth": 32,
+        "pixelDepth": 32,
+        "availLeft": 0,
+        "availTop": 0
+    },
+    "viewport": {
+        "width": 1920,
+        "height": 945  # window.innerHeight
+    },
+    "outerSize": {
+        "width": 1920,
+        "height": 1032
+    },
+    "devicePixelRatio": 1,
+    "webgl": {
+        "vendor": "Google Inc. (NVIDIA)",
+        "renderer": "ANGLE (NVIDIA, NVIDIA GeForce RTX 3050 Ti Laptop GPU (0x000025A0) Direct3D11 vs_5_0 ps_5_0, D3D11)"
+    },
+    "secChUa": '"Chromium";v="148", "Google Chrome";v="148", "Not/A)Brand";v="99"',
+    "secChUaPlatform": '"Windows"',
+    "secChUaMobile": "?0",
+    "acceptLanguage": "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7"
+}
+
+
+# =====================================================================
+# Anti-Detection JavaScript - überschreibt Browser-Properties
+# =====================================================================
+ANTI_DETECTION_SCRIPT = """
+(() => {
+    // 1. webdriver entfernen (kritisch!)
+    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+    
+    // 2. Plugins simulieren (5 PDF Viewer)
+    const pluginsData = [
+        {name: 'PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format'},
+        {name: 'Chrome PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format'},
+        {name: 'Chromium PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format'},
+        {name: 'Microsoft Edge PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format'},
+        {name: 'WebKit built-in PDF', filename: 'internal-pdf-viewer', description: 'Portable Document Format'}
+    ];
+    
+    Object.defineProperty(navigator, 'plugins', {
+        get: () => {
+            const plugins = pluginsData.map(p => ({
+                name: p.name,
+                filename: p.filename,
+                description: p.description,
+                length: 1
+            }));
+            plugins.length = pluginsData.length;
+            plugins.item = (i) => plugins[i];
+            plugins.namedItem = (n) => plugins.find(p => p.name === n);
+            return plugins;
+        }
+    });
+    
+    Object.defineProperty(navigator, 'pdfViewerEnabled', {get: () => true});
+    
+    // 3. Sprachen
+    Object.defineProperty(navigator, 'languages', {get: () => ['de-DE', 'de', 'en-US', 'en']});
+    Object.defineProperty(navigator, 'language', {get: () => 'de-DE'});
+    
+    // 4. Hardware
+    Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 12});
+    Object.defineProperty(navigator, 'deviceMemory', {get: () => 32});
+    Object.defineProperty(navigator, 'platform', {get: () => 'Win32'});
+    Object.defineProperty(navigator, 'vendor', {get: () => 'Google Inc.'});
+    Object.defineProperty(navigator, 'vendorSub', {get: () => ''});
+    Object.defineProperty(navigator, 'product', {get: () => 'Gecko'});
+    Object.defineProperty(navigator, 'productSub', {get: () => '20030107'});
+    Object.defineProperty(navigator, 'cookieEnabled', {get: () => true});
+    Object.defineProperty(navigator, 'onLine', {get: () => true});
+    
+    // 5. Chrome-Objekt (sehr wichtig für Cloudflare!)
+    if (!window.chrome) {
+        window.chrome = {};
+    }
+    window.chrome.runtime = window.chrome.runtime || {
+        onConnect: undefined,
+        onMessage: undefined,
+        connect: () => {},
+        sendMessage: () => {}
+    };
+    window.chrome.app = {
+        isInstalled: false,
+        InstallState: {DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed'},
+        RunningState: {CANNOT_RUN: 'cannot_run', READY_TO_RUN: 'ready_to_run', RUNNING: 'running'}
+    };
+    window.chrome.loadTimes = function() {
+        return {
+            requestTime: Date.now() / 1000 - 1,
+            startLoadTime: Date.now() / 1000 - 1,
+            commitLoadTime: Date.now() / 1000 - 0.5,
+            finishDocumentLoadTime: Date.now() / 1000 - 0.3,
+            finishLoadTime: Date.now() / 1000 - 0.1,
+            firstPaintTime: Date.now() / 1000 - 0.2,
+            firstPaintAfterLoadTime: 0,
+            navigationType: 'Other',
+            wasFetchedViaSpdy: true,
+            wasNpnNegotiated: true,
+            npnNegotiatedProtocol: 'h2',
+            wasAlternateProtocolAvailable: false,
+            connectionInfo: 'h2'
+        };
+    };
+    window.chrome.csi = function() {
+        return {
+            startE: Date.now(),
+            onloadT: Date.now(),
+            pageT: Date.now() - 100,
+            tran: 15
+        };
+    };
+    
+    // 6. WebGL Vendor/Renderer überschreiben (NVIDIA RTX 3050 Ti)
+    const getParameter = WebGLRenderingContext.prototype.getParameter;
+    WebGLRenderingContext.prototype.getParameter = function(parameter) {
+        if (parameter === 37445) {  // UNMASKED_VENDOR_WEBGL
+            return 'Google Inc. (NVIDIA)';
+        }
+        if (parameter === 37446) {  // UNMASKED_RENDERER_WEBGL
+            return 'ANGLE (NVIDIA, NVIDIA GeForce RTX 3050 Ti Laptop GPU (0x000025A0) Direct3D11 vs_5_0 ps_5_0, D3D11)';
+        }
+        return getParameter.call(this, parameter);
+    };
+    
+    // Auch für WebGL2
+    if (window.WebGL2RenderingContext) {
+        const getParameter2 = WebGL2RenderingContext.prototype.getParameter;
+        WebGL2RenderingContext.prototype.getParameter = function(parameter) {
+            if (parameter === 37445) return 'Google Inc. (NVIDIA)';
+            if (parameter === 37446) return 'ANGLE (NVIDIA, NVIDIA GeForce RTX 3050 Ti Laptop GPU (0x000025A0) Direct3D11 vs_5_0 ps_5_0, D3D11)';
+            return getParameter2.call(this, parameter);
+        };
+    }
+    
+    // 7. Screen-Properties
+    Object.defineProperty(screen, 'width', {get: () => 1920});
+    Object.defineProperty(screen, 'height', {get: () => 1080});
+    Object.defineProperty(screen, 'availWidth', {get: () => 1920});
+    Object.defineProperty(screen, 'availHeight', {get: () => 1032});
+    Object.defineProperty(screen, 'colorDepth', {get: () => 32});
+    Object.defineProperty(screen, 'pixelDepth', {get: () => 32});
+    Object.defineProperty(screen, 'availLeft', {get: () => 0});
+    Object.defineProperty(screen, 'availTop', {get: () => 0});
+    
+    // 8. Permissions API natürlicher
+    const originalQuery = window.navigator.permissions.query;
+    window.navigator.permissions.query = (parameters) => {
+        if (parameters.name === 'notifications') {
+            return Promise.resolve({state: 'prompt'});
+        }
+        return originalQuery(parameters);
+    };
+    
+    // 9. UserAgentData (Chrome 148)
+    if (navigator.userAgentData) {
+        const brands = [
+            {brand: "Chromium", version: "148"},
+            {brand: "Google Chrome", version: "148"},
+            {brand: "Not/A)Brand", version: "99"}
+        ];
+        Object.defineProperty(navigator.userAgentData, 'brands', {get: () => brands});
+        Object.defineProperty(navigator.userAgentData, 'mobile', {get: () => false});
+        Object.defineProperty(navigator.userAgentData, 'platform', {get: () => 'Windows'});
+    }
+    
+    // 10. iframe contentWindow chrome (für Cloudflare iframe-Check)
+    const iframeProto = HTMLIFrameElement.prototype;
+    const originalContentWindow = Object.getOwnPropertyDescriptor(iframeProto, 'contentWindow');
+})();
+"""
+
+
 class MailTM:
     """mail.tm API Client - kostenlose temporäre E-Mails ohne Cloudflare"""
     
@@ -45,12 +230,10 @@ class MailTM:
     
     async def create_account(self):
         async with aiohttp.ClientSession() as session:
-            # Domain holen
             async with session.get(f"{self.base_url}/domains") as r:
                 domains = (await r.json())["hydra:member"]
                 domain = domains[0]["domain"]
             
-            # Account erstellen
             user = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
             self.email = f"{user}@{domain}"
             self.password = ''.join(random.choices(string.ascii_letters + string.digits, k=12))
@@ -62,7 +245,6 @@ class MailTM:
                 if r.status != 201:
                     return None
             
-            # Token holen
             async with session.post(
                 f"{self.base_url}/token",
                 json={"address": self.email, "password": self.password}
@@ -91,160 +273,116 @@ class MailTM:
 async def solve_turnstile(page, max_wait=120):
     """
     Versucht Cloudflare Turnstile automatisch zu lösen.
-    
-    PixVerse rendert Turnstile in einem Container mit ID "cfcaptcha".
-    Der Continue-Button ist solange disabled bis das Turnstile gelöst ist.
+    Mit echtem Browser-Fingerprint sollte sich Turnstile passiv lösen.
     """
-    print("    Schritt 1: Warte auf Turnstile-Container (#cfcaptcha)...")
+    print("    [Turnstile] Warte auf Token (passive Lösung erwartet)...")
     
-    # Warte bis #cfcaptcha eine Größe hat (iframe wurde geladen)
-    container_pos = None
-    for i in range(30):  # 60 Sekunden
-        container_pos = await page.evaluate("""() => {
-            const el = document.querySelector('#cfcaptcha');
-            if (el) {
-                const rect = el.getBoundingClientRect();
-                if (rect.width > 0 && rect.height > 0) {
-                    // Prüfe ob iframe darin geladen ist
-                    const iframe = el.querySelector('iframe');
-                    return {
-                        x: rect.x,
-                        y: rect.y,
-                        width: rect.width,
-                        height: rect.height,
-                        hasIframe: !!iframe,
-                        iframeSrc: iframe ? iframe.src.substring(0, 80) : null
-                    };
-                }
-            }
-            return null;
+    # Phase 1: Passive Lösung erwarten
+    for i in range(20):
+        token = await page.evaluate("""() => {
+            const inp = document.querySelector('input[name="cf-turnstile-response"]');
+            return inp ? inp.value : null;
         }""")
         
-        if container_pos and container_pos.get("hasIframe"):
-            print(f"    [✓] #cfcaptcha bei ({container_pos['x']:.0f},{container_pos['y']:.0f}) {container_pos['width']:.0f}x{container_pos['height']:.0f}")
-            print(f"        iframe: {container_pos['iframeSrc']}")
-            break
+        if token and len(token) > 10:
+            print(f"    [✓] Turnstile passiv gelöst nach {i*2}s! Token: {token[:30]}...")
+            return True
         
         if i % 5 == 4:
-            print(f"    ... warte auf iframe ({(i+1)*2}s) - sichtbar: {container_pos is not None}")
+            print(f"    ... warte ({(i+1)*2}s)")
         
         await asyncio.sleep(2)
+    
+    # Phase 2: Container suchen und klicken
+    print("    [Turnstile] Suche Widget zum Klicken...")
+    
+    container_pos = await page.evaluate("""() => {
+        const el = document.querySelector('#cfcaptcha');
+        if (el) {
+            const rect = el.getBoundingClientRect();
+            const iframe = el.querySelector('iframe');
+            return {
+                x: rect.x, y: rect.y,
+                width: rect.width, height: rect.height,
+                hasIframe: !!iframe
+            };
+        }
+        return null;
+    }""")
     
     if not container_pos:
         print("    [WARN] #cfcaptcha nicht gefunden")
         return False
     
-    # Falls iframe nicht geladen wurde, versuche trotzdem zu klicken (triggert evtl. das Laden)
-    if not container_pos.get("hasIframe"):
-        print("    [INFO] iframe noch nicht geladen, klicke trotzdem auf Container...")
-        target_x = container_pos["x"] + container_pos["width"] / 2
-        target_y = container_pos["y"] + container_pos["height"] / 2
-        await page.mouse.move(target_x - 100, target_y - 50, steps=10)
-        await asyncio.sleep(0.3)
-        await page.mouse.move(target_x, target_y, steps=8)
-        await page.mouse.click(target_x, target_y)
-        print(f"    Container geklickt bei ({target_x:.0f},{target_y:.0f}), warte 5s...")
-        await asyncio.sleep(5)
-        
-        # Erneut prüfen ob iframe jetzt da ist
-        container_pos = await page.evaluate("""() => {
-            const el = document.querySelector('#cfcaptcha');
-            const iframe = el ? el.querySelector('iframe') : null;
-            if (el && iframe) {
-                const rect = el.getBoundingClientRect();
-                return {x: rect.x, y: rect.y, width: rect.width, height: rect.height, hasIframe: true};
-            }
-            return el ? {x: el.getBoundingClientRect().x, y: el.getBoundingClientRect().y, width: 380, height: 65, hasIframe: false} : null;
-        }""")
+    print(f"    [✓] Widget bei ({container_pos['x']:.0f}, {container_pos['y']:.0f}) iframe={container_pos['hasIframe']}")
     
-    # Phase 2: Auf das Widget klicken
-    print("    Schritt 2: Klicke auf Cloudflare-Checkbox...")
-    
-    # Die Checkbox ist meist links im Widget
-    # Container ist 380x65, Checkbox bei ca. x+30, y+zentral
+    # Klick mit menschlicher Mausbewegung
     target_x = container_pos["x"] + 30
     target_y = container_pos["y"] + container_pos["height"] / 2
     
-    print(f"    Bewege Maus zu ({target_x:.0f}, {target_y:.0f})")
-    
-    # Menschliche Mausbewegung
-    await asyncio.sleep(0.5)
-    await page.mouse.move(target_x - 250, target_y - 150, steps=20)
-    await asyncio.sleep(0.4)
-    await page.mouse.move(target_x - 100, target_y - 50, steps=15)
-    await asyncio.sleep(0.3)
-    await page.mouse.move(target_x - 30, target_y - 10, steps=10)
-    await asyncio.sleep(0.2)
+    # Mehrfache Mausbewegungen wie ein Mensch
+    await page.mouse.move(random.randint(100, 800), random.randint(100, 500), steps=10)
+    await asyncio.sleep(random.uniform(0.3, 0.7))
+    await page.mouse.move(target_x - 200, target_y - 100, steps=20)
+    await asyncio.sleep(random.uniform(0.2, 0.5))
+    await page.mouse.move(target_x - 50, target_y - 20, steps=15)
+    await asyncio.sleep(random.uniform(0.1, 0.3))
     await page.mouse.move(target_x, target_y, steps=8)
-    await asyncio.sleep(0.5)
+    await asyncio.sleep(random.uniform(0.3, 0.6))
     
-    # Klicken
     await page.mouse.click(target_x, target_y)
-    print(f"    [✓] Klick auf Position ({target_x:.0f}, {target_y:.0f})")
+    print(f"    [✓] Klick auf ({target_x:.0f}, {target_y:.0f})")
     
-    await asyncio.sleep(3)
-    
-    # Phase 3: Warte auf Token oder dass Continue-Button aktiviert wird
-    print("    Schritt 3: Warte auf Turnstile-Token (max 60s)...")
-    
+    # Phase 3: Erneut warten
     for i in range(30):
+        await asyncio.sleep(2)
         result = await page.evaluate("""() => {
             const inp = document.querySelector('input[name="cf-turnstile-response"]');
-            const btn = document.querySelector('button:has(div:nth-child(1))');
-            
-            // Suche Continue-Button
             const buttons = document.querySelectorAll('button');
-            let continueBtn = null;
+            let btn = null;
             for (const b of buttons) {
                 if (b.innerText.includes('Continue') || b.innerText.includes('Weiter')) {
-                    continueBtn = b;
+                    btn = b;
                     break;
                 }
             }
-            
             return {
                 token: inp ? inp.value : null,
-                tokenLength: inp && inp.value ? inp.value.length : 0,
-                btnClass: continueBtn ? continueBtn.className : null,
-                btnEnabled: continueBtn ? !continueBtn.className.includes('cursor-not-allowed') : false
+                btnEnabled: btn ? !btn.className.includes('cursor-not-allowed') : false
             };
         }""")
         
-        if result["token"] and result["tokenLength"] > 10:
-            print(f"    [✓] Token erhalten nach {i*2}s! (Länge: {result['tokenLength']})")
+        if result["token"] and len(result["token"]) > 10:
+            print(f"    [✓] Token nach Klick erhalten ({i*2}s)!")
             return True
-        
         if result["btnEnabled"]:
-            print(f"    [✓] Continue-Button aktiviert nach {i*2}s!")
+            print(f"    [✓] Continue aktiviert ({i*2}s)!")
             return True
         
-        await asyncio.sleep(2)
         if i % 10 == 9:
-            print(f"    ... warte ({(i+1)*2}s) - Button aktiviert: {result['btnEnabled']}")
+            print(f"    ... warte ({(i+1)*2}s)")
     
     return False
 
 
 async def main():
     print("=" * 70)
-    print("PixVerse AI Registrierung - Automatisch")
+    print("PixVerse Registrierung mit echtem Browser-Fingerprint")
     print("=" * 70)
+    print(f"Fingerprint: Chrome {FINGERPRINT['userAgent'].split('Chrome/')[1].split(' ')[0]} auf Windows 10")
+    print(f"             {FINGERPRINT['webgl']['renderer'][:60]}...")
     
     # Mail erstellen
-    print("\n[1] Erstelle temporäre E-Mail über mail.tm...")
+    print("\n[1] Erstelle temporäre E-Mail (mail.tm)...")
     mail = MailTM()
     temp_email = await mail.create_account()
-    
     if not temp_email:
-        print("    [FEHLER] Konnte E-Mail nicht erstellen")
+        print("    [FEHLER]")
         return
+    print(f"    E-Mail: {temp_email}")
     
-    print(f"    [✓] E-Mail: {temp_email}")
-    
-    # Daten generieren
     username = ''.join(random.choices(string.ascii_lowercase, k=8))
     password = "TestPass123!" + ''.join(random.choices(string.digits, k=3))
-    
     print(f"    Username: {username}")
     print(f"    Passwort: {password}")
     
@@ -258,91 +396,115 @@ async def main():
     
     async with async_playwright() as p:
         browser = await p.chromium.launch(
-            headless=False,  # SICHTBAR für Cloudflare Turnstile
+            headless=False,
             args=[
                 '--disable-blink-features=AutomationControlled',
-                '--no-sandbox'
+                '--disable-features=IsolateOrigins,site-per-process',
+                '--no-sandbox',
+                '--disable-dev-shm-usage',
+                f'--window-size={FINGERPRINT["outerSize"]["width"]},{FINGERPRINT["outerSize"]["height"]}',
             ]
         )
+        
+        # Context mit allen Fingerprint-Werten
         context = await browser.new_context(
-            viewport={"width": 1400, "height": 900},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-            locale="de-DE",
-            timezone_id="Europe/Berlin"
+            viewport={
+                "width": FINGERPRINT["viewport"]["width"],
+                "height": FINGERPRINT["viewport"]["height"]
+            },
+            user_agent=FINGERPRINT["userAgent"],
+            locale=FINGERPRINT["language"],
+            timezone_id=FINGERPRINT["timezone"],
+            screen={
+                "width": FINGERPRINT["screen"]["width"],
+                "height": FINGERPRINT["screen"]["height"]
+            },
+            device_scale_factor=FINGERPRINT["devicePixelRatio"],
+            color_scheme="light",
+            extra_http_headers={
+                "Accept-Language": FINGERPRINT["acceptLanguage"],
+                "sec-ch-ua": FINGERPRINT["secChUa"],
+                "sec-ch-ua-mobile": FINGERPRINT["secChUaMobile"],
+                "sec-ch-ua-platform": FINGERPRINT["secChUaPlatform"],
+            }
         )
         
-        # Anti-Detection
-        await context.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-            Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
-            Object.defineProperty(navigator, 'languages', {get: () => ['de-DE','de','en']});
-            Object.defineProperty(navigator, 'platform', {get: () => 'Win32'});
-            window.chrome = {runtime: {}, loadTimes: function(){}, csi: function(){}};
-        """)
+        # Anti-Detection vor jeder Seite injizieren
+        await context.add_init_script(ANTI_DETECTION_SCRIPT)
         
         page = await context.new_page()
         
         try:
-            # Register-Seite
             print("\n[2] Öffne PixVerse Register...")
             await page.goto("https://app.pixverse.ai/register", wait_until="load", timeout=30000)
             await asyncio.sleep(3)
             
+            # Fingerprint überprüfen
+            print("\n[3] Überprüfe Fingerprint...")
+            fp_check = await page.evaluate("""() => ({
+                userAgent: navigator.userAgent,
+                platform: navigator.platform,
+                hardwareConcurrency: navigator.hardwareConcurrency,
+                deviceMemory: navigator.deviceMemory,
+                webdriver: navigator.webdriver,
+                pluginsLen: navigator.plugins.length,
+                languages: navigator.languages,
+                vendor: navigator.vendor,
+                hasChrome: !!window.chrome,
+                hasChromeRuntime: !!(window.chrome && window.chrome.runtime),
+                screenW: screen.width,
+                screenH: screen.height
+            })""")
+            
+            print(f"    UserAgent: {fp_check['userAgent'][:60]}...")
+            print(f"    Platform: {fp_check['platform']}, CPUs: {fp_check['hardwareConcurrency']}, RAM: {fp_check['deviceMemory']}GB")
+            print(f"    webdriver: {fp_check['webdriver']} (sollte undefined sein!)")
+            print(f"    Plugins: {fp_check['pluginsLen']}, Chrome: {fp_check['hasChrome']}, Runtime: {fp_check['hasChromeRuntime']}")
+            print(f"    Screen: {fp_check['screenW']}x{fp_check['screenH']}")
+            
             # Formular ausfüllen
-            print("\n[3] Fülle Formular aus...")
-            
-            # Sichtbare Inputs holen
-            visible_inputs = []
-            all_inputs = await page.query_selector_all("input")
-            for inp in all_inputs:
+            print("\n[4] Fülle Formular...")
+            inputs = await page.query_selector_all("input")
+            visible = []
+            for inp in inputs:
                 if await inp.is_visible():
-                    visible_inputs.append(inp)
+                    visible.append(inp)
             
-            if len(visible_inputs) >= 4:
-                # Mit "human-like" Tippen
-                await visible_inputs[0].click()
-                await visible_inputs[0].type(username, delay=80)
-                await asyncio.sleep(0.5)
+            if len(visible) >= 4:
+                await visible[0].click()
+                await visible[0].type(username, delay=random.randint(50, 120))
+                await asyncio.sleep(random.uniform(0.3, 0.7))
                 
-                await visible_inputs[1].click()
-                await visible_inputs[1].type(temp_email, delay=80)
-                await asyncio.sleep(0.5)
+                await visible[1].click()
+                await visible[1].type(temp_email, delay=random.randint(50, 120))
+                await asyncio.sleep(random.uniform(0.3, 0.7))
                 
-                await visible_inputs[2].click()
-                await visible_inputs[2].type(password, delay=80)
-                await asyncio.sleep(0.5)
+                await visible[2].click()
+                await visible[2].type(password, delay=random.randint(50, 120))
+                await asyncio.sleep(random.uniform(0.3, 0.7))
                 
-                await visible_inputs[3].click()
-                await visible_inputs[3].type(password, delay=80)
-                await asyncio.sleep(0.5)
+                await visible[3].click()
+                await visible[3].type(password, delay=random.randint(50, 120))
+                await asyncio.sleep(random.uniform(0.5, 1.0))
                 
-                print(f"    Username: {username}")
-                print(f"    E-Mail: {temp_email}")
-                print(f"    Passwort: {password}")
+                print(f"    [✓] Username, E-Mail, Passwort eingegeben")
             
-            # Warte 2 Sekunden bis Turnstile geladen ist
-            print("\n[4] Warte auf Turnstile-Widget (2s)...")
-            await asyncio.sleep(2)
-            
-            # Turnstile zuerst lösen (Continue-Button ist disabled bis Token da ist!)
-            print("\n[5] Versuche Cloudflare Turnstile zu lösen...")
-            
+            # Turnstile lösen
+            print("\n[5] Cloudflare Turnstile lösen...")
             turnstile_solved = await solve_turnstile(page)
             
             if not turnstile_solved:
-                print("    [⚠️] Turnstile nicht automatisch gelöst")
-                print("    Bitte löse das Captcha manuell im Browser!")
-                input("    Drücke Enter wenn das Captcha gelöst ist...")
+                print("    [⚠️] Manuell lösen wenn nötig")
+                input("    Drücke Enter wenn Captcha gelöst ist...")
             
-            # Jetzt Continue klicken (sollte jetzt aktiviert sein)
-            print("\n[6] Klicke 'Continue/Weiter'...")
-            await asyncio.sleep(1)
+            # Continue klicken
+            print("\n[6] Klicke Continue/Weiter...")
+            await asyncio.sleep(random.uniform(0.5, 1.5))
             btn = await page.query_selector("button:has-text('Continue'), button:has-text('Weiter')")
             if btn:
-                # Prüfe ob Button aktiv ist
                 btn_class = await btn.get_attribute("class") or ""
                 if "cursor-not-allowed" in btn_class:
-                    print("    [⚠️] Button ist noch deaktiviert - warte 5s und versuche erneut")
+                    print("    [WARN] Button noch deaktiviert, warte 5s...")
                     await asyncio.sleep(5)
                 
                 await btn.click(force=True)
@@ -352,94 +514,77 @@ async def main():
             print(f"    URL: {page.url}")
             
             # Auf E-Mail warten
-            print("\n[6] Warte auf Verifizierungs-E-Mail (max 3 Min)...")
-            
+            print("\n[7] Warte auf Verifizierungs-E-Mail (3 Min)...")
             verification_code = None
             verification_link = None
             
-            for i in range(36):  # 3 Minuten
+            for i in range(36):
                 messages = await mail.get_messages()
-                
                 if messages:
                     print(f"\n    [✓] E-Mail empfangen!")
                     msg = messages[0]
                     print(f"    Von: {msg.get('from', {}).get('address')}")
                     print(f"    Betreff: {msg.get('subject')}")
                     
-                    # Details holen
                     detail = await mail.get_message(msg["id"])
                     text = detail.get("text", "")
                     html_data = detail.get("html", [])
                     full_html = " ".join(html_data) if isinstance(html_data, list) else str(html_data)
                     full_content = text + " " + full_html
                     
-                    # Code extrahieren
                     codes = re.findall(r'\b(\d{4,8})\b', full_content)
-                    if codes:
-                        # Filter: nur sinnvolle Codes (4-6 stellig)
-                        codes_filtered = [c for c in codes if 4 <= len(c) <= 6]
-                        if codes_filtered:
-                            verification_code = codes_filtered[0]
-                            print(f"    Code: {verification_code}")
+                    codes_filt = [c for c in codes if 4 <= len(c) <= 6]
+                    if codes_filt:
+                        verification_code = codes_filt[0]
+                        print(f"    Code: {verification_code}")
                     
-                    # Link extrahieren
                     links = re.findall(r'https?://[^\s<>"\']+', full_html)
                     for link in links:
-                        if "pixverse" in link.lower() and ("verify" in link.lower() or "confirm" in link.lower() or "activate" in link.lower()):
+                        if "pixverse" in link.lower() and any(k in link.lower() for k in ["verify", "confirm", "activate"]):
                             verification_link = link
                             print(f"    Link: {link[:80]}")
                             break
-                    
                     break
                 
                 await asyncio.sleep(5)
                 if i % 6 == 5:
-                    print(f"    ... noch nichts ({(i+1)*5}s)")
+                    print(f"    ... {(i+1)*5}s")
             
             # Verifizieren
             if verification_link:
-                print(f"\n[7] Öffne Verifizierungslink...")
+                print(f"\n[8] Öffne Verifizierungslink...")
                 await page.goto(verification_link, wait_until="load")
                 await asyncio.sleep(5)
-                print(f"    URL: {page.url}")
-                
                 if "register" not in page.url.lower():
                     result["success"] = True
                     print("\n    ✅ REGISTRIERUNG ERFOLGREICH!")
-            
             elif verification_code:
-                print(f"\n[7] Gebe Code ein: {verification_code}")
-                code_inputs = []
-                all_inps = await page.query_selector_all("input")
-                for inp in all_inps:
+                print(f"\n[8] Gebe Code ein: {verification_code}")
+                code_inps = []
+                for inp in await page.query_selector_all("input"):
                     if await inp.is_visible():
-                        code_inputs.append(inp)
-                
-                if len(code_inputs) >= len(verification_code):
-                    for idx, digit in enumerate(verification_code):
-                        await code_inputs[idx].fill(digit)
+                        code_inps.append(inp)
+                if len(code_inps) >= len(verification_code):
+                    for idx, d in enumerate(verification_code):
+                        await code_inps[idx].fill(d)
                         await asyncio.sleep(0.2)
-                    
                     await asyncio.sleep(3)
                     if "register" not in page.url.lower():
                         result["success"] = True
                         print("\n    ✅ REGISTRIERUNG ERFOLGREICH!")
             
-            else:
-                print("\n    [⚠️] Keine Verifizierung empfangen")
-            
-            # Warte
             print("\n    Warte 10s vor Beenden...")
             await asyncio.sleep(10)
             
         except Exception as e:
             print(f"\n[FEHLER] {e}")
+            import traceback
+            traceback.print_exc()
             result["error"] = str(e)
         
         finally:
             await browser.close()
     
-    # Ergebnis speichern
     with open("pixverse_account.json", "w") as f:
         json.dump(result, f, indent=2)
     
@@ -450,7 +595,6 @@ async def main():
     print(f"Username: {username}")
     print(f"Passwort: {password}")
     print(f"Erfolgreich: {result['success']}")
-    print(f"\nGespeichert in: pixverse_account.json")
 
 
 if __name__ == "__main__":
