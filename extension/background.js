@@ -316,6 +316,7 @@ async function currentIter() {
 
 async function stopRun() {
   await chrome.alarms.clear("pv-inbox-poll");
+  await chrome.alarms.clear("pv-next-iteration");
   await chrome.storage.local.set({ [STATE_KEYS.RUN_ACTIVE]: false });
   await setStatus("idle");
   log("Run stopped");
@@ -675,6 +676,20 @@ async function prepareNextRun() {
 // Inbox polling driven by chrome.alarms
 // -----------------------------------------------------------------------------
 chrome.alarms.onAlarm.addListener(async (alarm) => {
+  // Wakes up to start the next iteration after the cool-down between runs.
+  // We use chrome.alarms here instead of setTimeout because the service
+  // worker is allowed to go idle after ~30s of inactivity, and setTimeout
+  // does NOT survive that. Alarms re-wake the SW reliably.
+  if (alarm.name === "pv-next-iteration") {
+    const state = await getState();
+    if (!state[STATE_KEYS.RUN_ACTIVE]) {
+      log("alarm pv-next-iteration: run no longer active, ignoring");
+      return;
+    }
+    log("alarm pv-next-iteration: waking up for next iteration");
+    await prepareNextRun();
+    return;
+  }
   if (alarm.name !== "pv-inbox-poll") return;
   const state = await getState();
   if (!state[STATE_KEYS.RUN_ACTIVE]) return;
@@ -783,7 +798,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             // have to back off anyway. Stay safely above their threshold.
             const delaySec = 35 + Math.floor(Math.random() * 10); // 35-45s
             log(`Next iteration in ${delaySec}s ...`);
-            setTimeout(() => prepareNextRun(), delaySec * 1000);
+            // chrome.alarms wakes the service worker even if it went idle.
+            // setTimeout would silently die after ~30s of SW inactivity.
+            await chrome.alarms.clear("pv-next-iteration");
+            await chrome.alarms.create("pv-next-iteration", {
+              when: Date.now() + delaySec * 1000,
+            });
           } else {
             log("All iterations done. Stopping.");
             await stopRun();
