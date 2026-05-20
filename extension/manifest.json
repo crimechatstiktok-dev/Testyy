@@ -16,7 +16,8 @@
   ],
 
   "host_permissions": [
-    "https://app.pixverse.ai/*",
+    "https://*.pixverse.ai/*",
+    "https://pixverse.ai/*",
     "https://api.mail.tm/*"
   ],
 

@@ -275,85 +275,148 @@ async function stopRun() {
 // -----------------------------------------------------------------------------
 async function clearPixverseCookies() {
   let removed = 0;
+  let found = 0;
   try {
+    // Try every reasonable selector. chrome.cookies.getAll requires
+    // host_permissions for the matched URL/domain; the manifest grants
+    // *.pixverse.ai so all of these should resolve.
     const sets = await Promise.all([
       chrome.cookies.getAll({ domain: "pixverse.ai" }),
       chrome.cookies.getAll({ domain: "app.pixverse.ai" }),
       chrome.cookies.getAll({ domain: ".pixverse.ai" }),
+      chrome.cookies.getAll({ url: "https://app.pixverse.ai/" }),
+      chrome.cookies.getAll({ url: "https://pixverse.ai/" }),
     ]);
     const seen = new Set();
     const all = [];
     for (const list of sets) {
       for (const c of list || []) {
-        const key = `${c.domain}|${c.path}|${c.name}`;
+        const key = `${c.domain}|${c.path}|${c.name}|${c.partitionKey?.topLevelSite || ""}`;
         if (seen.has(key)) continue;
         seen.add(key);
         all.push(c);
       }
     }
+    found = all.length;
     for (const c of all) {
       const url = `${c.secure ? "https" : "http"}://${c.domain.replace(/^\./, "")}${c.path}`;
       try {
-        await chrome.cookies.remove({ url, name: c.name, storeId: c.storeId });
+        const removeOpts = { url, name: c.name, storeId: c.storeId };
+        if (c.partitionKey) removeOpts.partitionKey = c.partitionKey;
+        await chrome.cookies.remove(removeOpts);
         removed++;
       } catch (e) { /* keep going */ }
     }
   } catch (e) {
     log(`cookie clear error: ${e.message}`);
   }
-  log(`Cleared ${removed} cookies for pixverse.ai`);
+  log(`Cookies: found=${found}, removed=${removed}`);
 }
 
-// Clears localStorage / sessionStorage / IndexedDB on every open pixverse tab
-// using chrome.scripting.executeScript. Cookie-only logout is not enough
-// because PixVerse keeps its JWT in web storage too.
+// Clears localStorage / sessionStorage / IndexedDB / Cache Storage and
+// unregisters all service workers on every open pixverse tab.
+// Cookie-only logout is not enough because PixVerse keeps its JWT in
+// web storage too. We use an async function so we can actually wait for
+// IndexedDB.databases() to settle before returning.
 async function clearPixverseWebStorage() {
   const tabs = await chrome.tabs.query({ url: "https://app.pixverse.ai/*" });
+  if (!tabs.length) {
+    log("Web storage clear: no pixverse tab found yet");
+    return;
+  }
+
+  const totals = { ls: 0, ss: 0, idb: 0, sw: 0, caches: 0 };
+
   for (const t of tabs) {
+    let results;
     try {
-      await chrome.scripting.executeScript({
+      results = await chrome.scripting.executeScript({
         target: { tabId: t.id },
-        func: () => {
-          try { localStorage.clear(); } catch (_) {}
-          try { sessionStorage.clear(); } catch (_) {}
+        // Async function -> executeScript awaits the returned Promise.
+        func: async () => {
+          const out = { ls: 0, ss: 0, idb: 0, sw: 0, caches: 0, errors: [] };
           try {
-            if (indexedDB && typeof indexedDB.databases === "function") {
-              indexedDB.databases().then((dbs) => {
-                for (const db of dbs || []) {
-                  try { indexedDB.deleteDatabase(db.name); } catch (_) {}
-                }
-              }).catch(() => {});
+            out.ls = localStorage.length;
+            localStorage.clear();
+          } catch (e) { out.errors.push("ls:" + e.message); }
+          try {
+            out.ss = sessionStorage.length;
+            sessionStorage.clear();
+          } catch (e) { out.errors.push("ss:" + e.message); }
+          try {
+            if (typeof indexedDB.databases === "function") {
+              const dbs = await indexedDB.databases();
+              out.idb = dbs.length;
+              await Promise.all((dbs || []).map((db) =>
+                new Promise((resolve) => {
+                  try {
+                    const req = indexedDB.deleteDatabase(db.name);
+                    req.onsuccess = req.onerror = req.onblocked = () => resolve();
+                  } catch (_) { resolve(); }
+                })
+              ));
             }
-          } catch (_) {}
+          } catch (e) { out.errors.push("idb:" + e.message); }
+          try {
+            if (navigator.serviceWorker) {
+              const regs = await navigator.serviceWorker.getRegistrations();
+              for (const r of regs || []) {
+                try { await r.unregister(); out.sw++; } catch (_) {}
+              }
+            }
+          } catch (e) { out.errors.push("sw:" + e.message); }
+          try {
+            if (self.caches && caches.keys) {
+              const ks = await caches.keys();
+              out.caches = ks.length;
+              await Promise.all(ks.map((k) => caches.delete(k).catch(() => {})));
+            }
+          } catch (e) { out.errors.push("caches:" + e.message); }
+          return out;
         },
       });
     } catch (e) {
-      log(`scripting on tab ${t.id} failed: ${e.message}`);
+      log(`scripting on tab ${t.id} (${t.url}) failed: ${e.message}`);
+      continue;
+    }
+    const r = (results && results[0] && results[0].result) || {};
+    totals.ls += r.ls || 0;
+    totals.ss += r.ss || 0;
+    totals.idb += r.idb || 0;
+    totals.sw += r.sw || 0;
+    totals.caches += r.caches || 0;
+    if (r.errors && r.errors.length) {
+      log(`web storage tab ${t.id} partial errors: ${r.errors.join(" | ")}`);
     }
   }
+  log(`Web storage cleared: ls=${totals.ls} ss=${totals.ss} idb=${totals.idb} sw=${totals.sw} caches=${totals.caches}`);
 }
 
 // Wipe all auth surfaces, then navigate (or open) a tab to /register so the
 // SPA reboots completely and lands on the registration form.
 async function forceLogoutAndOpenRegister() {
-  await clearPixverseCookies();
+  // 1) Clear web storage WHILE we're still on a pixverse origin (so the
+  //    same-origin restrictions of localStorage/IndexedDB are satisfied).
   await clearPixverseWebStorage();
+  // 2) Cookies (chrome.cookies API doesn't care about the active tab).
+  await clearPixverseCookies();
 
+  // 3) Hop to about:blank first to evict any cached SPA state, then to
+  //    /register. tabs.update doesn't always force a fresh load if the
+  //    target URL is the same origin and the SPA intercepts navigation,
+  //    so the about:blank detour guarantees a real page reload.
   const tabs = await chrome.tabs.query({ url: "https://app.pixverse.ai/*" });
   let tab = tabs[0];
   if (!tab) {
-    tab = await chrome.tabs.create({
-      url: "https://app.pixverse.ai/register",
-      active: true,
-    });
+    tab = await chrome.tabs.create({ url: "about:blank", active: true });
   } else {
-    await chrome.tabs.update(tab.id, {
-      url: "https://app.pixverse.ai/register",
-      active: true,
-    });
+    await chrome.tabs.update(tab.id, { url: "about:blank", active: true });
   }
+  await new Promise((r) => setTimeout(r, 700));
+
+  await chrome.tabs.update(tab.id, { url: "https://app.pixverse.ai/register" });
   // Wait for navigation + content script (re-)injection to settle.
-  await new Promise((r) => setTimeout(r, 2500));
+  await new Promise((r) => setTimeout(r, 2800));
   return tab;
 }
 
