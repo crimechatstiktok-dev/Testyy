@@ -92,139 +92,135 @@ async def solve_turnstile(page, max_wait=120):
     """
     Versucht Cloudflare Turnstile automatisch zu lösen.
     
-    WICHTIG: Diese Funktion wird NACH dem Continue-Klick aufgerufen,
-    weil Turnstile bei PixVerse erst nach diesem Klick erscheint.
+    PixVerse rendert Turnstile in einem Container mit ID "cfcaptcha".
+    Der Continue-Button ist solange disabled bis das Turnstile gelöst ist.
     """
-    print("    Schritt 1: Warte auf Turnstile-iframe (max 30s)...")
+    print("    Schritt 1: Warte auf Turnstile-Container (#cfcaptcha)...")
     
-    # Warte bis das Turnstile-iframe erscheint
-    turnstile_frame = None
-    for i in range(15):
-        frames = page.frames
-        for frame in frames:
-            if "challenges.cloudflare.com" in frame.url:
-                turnstile_frame = frame
-                print(f"    [✓] iframe gefunden nach {i*2}s")
-                break
-        
-        if turnstile_frame:
-            break
-        
-        # Auch nach data-sitekey suchen (Container)
-        widget = await page.evaluate("""() => {
-            const el = document.querySelector('[data-sitekey], iframe[src*="challenges.cloudflare"], iframe[src*="turnstile"]');
+    # Warte bis #cfcaptcha eine Größe hat (iframe wurde geladen)
+    container_pos = None
+    for i in range(30):  # 60 Sekunden
+        container_pos = await page.evaluate("""() => {
+            const el = document.querySelector('#cfcaptcha');
             if (el) {
                 const rect = el.getBoundingClientRect();
-                return {x: rect.x, y: rect.y, w: rect.width, h: rect.height};
-            }
-            return null;
-        }""")
-        
-        if widget and widget["w"] > 0:
-            print(f"    [✓] Widget Element gefunden: ({widget['x']:.0f},{widget['y']:.0f}) {widget['w']:.0f}x{widget['h']:.0f}")
-            break
-        
-        await asyncio.sleep(2)
-    
-    # Phase 2: Versuche zu klicken
-    print("    Schritt 2: Suche Klickposition...")
-    
-    try:
-        # Hole die Position des Turnstile-Widgets
-        widget_pos = await page.evaluate("""() => {
-            // Versuche verschiedene Selektoren
-            const selectors = [
-                'iframe[src*="challenges.cloudflare.com"]',
-                'iframe[src*="turnstile"]',
-                '[data-sitekey]',
-                'div[class*="cf-turnstile"]',
-                'div[class*="turnstile"]'
-            ];
-            
-            for (const sel of selectors) {
-                const el = document.querySelector(sel);
-                if (el) {
-                    const rect = el.getBoundingClientRect();
-                    if (rect.width > 0 && rect.height > 0) {
-                        return {
-                            selector: sel,
-                            x: rect.x,
-                            y: rect.y,
-                            width: rect.width,
-                            height: rect.height
-                        };
-                    }
+                if (rect.width > 0 && rect.height > 0) {
+                    // Prüfe ob iframe darin geladen ist
+                    const iframe = el.querySelector('iframe');
+                    return {
+                        x: rect.x,
+                        y: rect.y,
+                        width: rect.width,
+                        height: rect.height,
+                        hasIframe: !!iframe,
+                        iframeSrc: iframe ? iframe.src.substring(0, 80) : null
+                    };
                 }
             }
             return null;
         }""")
         
-        if widget_pos:
-            print(f"    [✓] Widget bei ({widget_pos['x']:.0f},{widget_pos['y']:.0f}) {widget_pos['width']:.0f}x{widget_pos['height']:.0f}")
-            
-            # Bei Turnstile ist die Checkbox links im Widget
-            # Standardmäßig bei x+30, y+zentral
-            target_x = widget_pos["x"] + 30
-            target_y = widget_pos["y"] + widget_pos["height"] / 2
-            
-            print(f"    Bewege Maus zu ({target_x:.0f}, {target_y:.0f})")
-            
-            # Menschliche Mausbewegung
-            await asyncio.sleep(0.5)
-            await page.mouse.move(target_x - 200, target_y - 100, steps=15)
-            await asyncio.sleep(0.3)
-            await page.mouse.move(target_x - 50, target_y - 20, steps=10)
-            await asyncio.sleep(0.2)
-            await page.mouse.move(target_x, target_y, steps=8)
-            await asyncio.sleep(0.5)
-            
-            # Klicken
-            await page.mouse.click(target_x, target_y)
-            print(f"    [✓] Klick auf Turnstile-Widget")
-            
-            await asyncio.sleep(3)
-        else:
-            print("    [INFO] Kein sichtbares Widget - versuche iframe direkt")
-            
-            # Fallback: Versuche im iframe zu klicken
-            for frame in page.frames:
-                if "challenges.cloudflare.com" in frame.url:
-                    try:
-                        # Versuche alle möglichen Elemente
-                        for sel in ["input[type='checkbox']", "label", "#challenge-stage", 
-                                   "div[role='button']", "button", "[tabindex='0']"]:
-                            try:
-                                el = await frame.wait_for_selector(sel, timeout=2000)
-                                if el:
-                                    await el.click(force=True, timeout=3000)
-                                    print(f"    [✓] Klick auf '{sel}' im iframe")
-                                    await asyncio.sleep(3)
-                                    break
-                            except:
-                                continue
-                    except Exception as e:
-                        print(f"    [WARN] iframe-Klick: {e}")
-                    break
+        if container_pos and container_pos.get("hasIframe"):
+            print(f"    [✓] #cfcaptcha bei ({container_pos['x']:.0f},{container_pos['y']:.0f}) {container_pos['width']:.0f}x{container_pos['height']:.0f}")
+            print(f"        iframe: {container_pos['iframeSrc']}")
+            break
         
-    except Exception as e:
-        print(f"    [WARN] Fehler beim Klicken: {e}")
+        if i % 5 == 4:
+            print(f"    ... warte auf iframe ({(i+1)*2}s) - sichtbar: {container_pos is not None}")
+        
+        await asyncio.sleep(2)
     
-    # Phase 3: Warte auf Token
+    if not container_pos:
+        print("    [WARN] #cfcaptcha nicht gefunden")
+        return False
+    
+    # Falls iframe nicht geladen wurde, versuche trotzdem zu klicken (triggert evtl. das Laden)
+    if not container_pos.get("hasIframe"):
+        print("    [INFO] iframe noch nicht geladen, klicke trotzdem auf Container...")
+        target_x = container_pos["x"] + container_pos["width"] / 2
+        target_y = container_pos["y"] + container_pos["height"] / 2
+        await page.mouse.move(target_x - 100, target_y - 50, steps=10)
+        await asyncio.sleep(0.3)
+        await page.mouse.move(target_x, target_y, steps=8)
+        await page.mouse.click(target_x, target_y)
+        print(f"    Container geklickt bei ({target_x:.0f},{target_y:.0f}), warte 5s...")
+        await asyncio.sleep(5)
+        
+        # Erneut prüfen ob iframe jetzt da ist
+        container_pos = await page.evaluate("""() => {
+            const el = document.querySelector('#cfcaptcha');
+            const iframe = el ? el.querySelector('iframe') : null;
+            if (el && iframe) {
+                const rect = el.getBoundingClientRect();
+                return {x: rect.x, y: rect.y, width: rect.width, height: rect.height, hasIframe: true};
+            }
+            return el ? {x: el.getBoundingClientRect().x, y: el.getBoundingClientRect().y, width: 380, height: 65, hasIframe: false} : null;
+        }""")
+    
+    # Phase 2: Auf das Widget klicken
+    print("    Schritt 2: Klicke auf Cloudflare-Checkbox...")
+    
+    # Die Checkbox ist meist links im Widget
+    # Container ist 380x65, Checkbox bei ca. x+30, y+zentral
+    target_x = container_pos["x"] + 30
+    target_y = container_pos["y"] + container_pos["height"] / 2
+    
+    print(f"    Bewege Maus zu ({target_x:.0f}, {target_y:.0f})")
+    
+    # Menschliche Mausbewegung
+    await asyncio.sleep(0.5)
+    await page.mouse.move(target_x - 250, target_y - 150, steps=20)
+    await asyncio.sleep(0.4)
+    await page.mouse.move(target_x - 100, target_y - 50, steps=15)
+    await asyncio.sleep(0.3)
+    await page.mouse.move(target_x - 30, target_y - 10, steps=10)
+    await asyncio.sleep(0.2)
+    await page.mouse.move(target_x, target_y, steps=8)
+    await asyncio.sleep(0.5)
+    
+    # Klicken
+    await page.mouse.click(target_x, target_y)
+    print(f"    [✓] Klick auf Position ({target_x:.0f}, {target_y:.0f})")
+    
+    await asyncio.sleep(3)
+    
+    # Phase 3: Warte auf Token oder dass Continue-Button aktiviert wird
     print("    Schritt 3: Warte auf Turnstile-Token (max 60s)...")
     
     for i in range(30):
-        token = await page.evaluate("""() => {
+        result = await page.evaluate("""() => {
             const inp = document.querySelector('input[name="cf-turnstile-response"]');
-            return inp ? inp.value : null;
+            const btn = document.querySelector('button:has(div:nth-child(1))');
+            
+            // Suche Continue-Button
+            const buttons = document.querySelectorAll('button');
+            let continueBtn = null;
+            for (const b of buttons) {
+                if (b.innerText.includes('Continue') || b.innerText.includes('Weiter')) {
+                    continueBtn = b;
+                    break;
+                }
+            }
+            
+            return {
+                token: inp ? inp.value : null,
+                tokenLength: inp && inp.value ? inp.value.length : 0,
+                btnClass: continueBtn ? continueBtn.className : null,
+                btnEnabled: continueBtn ? !continueBtn.className.includes('cursor-not-allowed') : false
+            };
         }""")
         
-        if token and len(token) > 10:
-            print(f"    [✓] Token erhalten nach {i*2}s!")
+        if result["token"] and result["tokenLength"] > 10:
+            print(f"    [✓] Token erhalten nach {i*2}s! (Länge: {result['tokenLength']})")
+            return True
+        
+        if result["btnEnabled"]:
+            print(f"    [✓] Continue-Button aktiviert nach {i*2}s!")
             return True
         
         await asyncio.sleep(2)
         if i % 10 == 9:
-            print(f"    ... warte ({(i+1)*2}s)")
+            print(f"    ... warte ({(i+1)*2}s) - Button aktiviert: {result['btnEnabled']}")
     
     return False
 
@@ -324,16 +320,11 @@ async def main():
                 print(f"    E-Mail: {temp_email}")
                 print(f"    Passwort: {password}")
             
-            # Warte auf Cloudflare Turnstile
-            print("\n[4] Klicke 'Continue/Weiter' (triggert Turnstile)...")
-            btn = await page.query_selector("button:has-text('Continue'), button:has-text('Weiter')")
-            if btn:
-                await btn.click()
-                print("    [✓] Continue geklickt")
-            
+            # Warte 2 Sekunden bis Turnstile geladen ist
+            print("\n[4] Warte auf Turnstile-Widget (2s)...")
             await asyncio.sleep(2)
             
-            # Jetzt sollte Turnstile erscheinen
+            # Turnstile zuerst lösen (Continue-Button ist disabled bis Token da ist!)
             print("\n[5] Versuche Cloudflare Turnstile zu lösen...")
             
             turnstile_solved = await solve_turnstile(page)
@@ -343,12 +334,19 @@ async def main():
                 print("    Bitte löse das Captcha manuell im Browser!")
                 input("    Drücke Enter wenn das Captcha gelöst ist...")
             
-            # Falls Continue nochmal geklickt werden muss
-            print("\n[6] Klicke Continue nochmal (falls nötig)...")
+            # Jetzt Continue klicken (sollte jetzt aktiviert sein)
+            print("\n[6] Klicke 'Continue/Weiter'...")
+            await asyncio.sleep(1)
             btn = await page.query_selector("button:has-text('Continue'), button:has-text('Weiter')")
-            if btn and not (await btn.is_disabled()):
-                await btn.click()
-                print("    [✓] Erneut geklickt")
+            if btn:
+                # Prüfe ob Button aktiv ist
+                btn_class = await btn.get_attribute("class") or ""
+                if "cursor-not-allowed" in btn_class:
+                    print("    [⚠️] Button ist noch deaktiviert - warte 5s und versuche erneut")
+                    await asyncio.sleep(5)
+                
+                await btn.click(force=True)
+                print("    [✓] Geklickt")
             
             await asyncio.sleep(5)
             print(f"    URL: {page.url}")
