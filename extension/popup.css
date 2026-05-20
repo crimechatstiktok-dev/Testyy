@@ -86,6 +86,21 @@ section h2 { font-size: 12px; margin: 0 0 8px; text-transform: uppercase; color:
   font-family: ui-monospace, monospace;
 }
 
+.export .row { display: flex; align-items: center; gap: 6px; }
+.export-count {
+  flex: 1; color: #6b7280; font-size: 11px;
+  font-family: ui-monospace, monospace;
+}
+.export button {
+  padding: 6px 10px; border: 1px solid #d1d5db; background: #fff;
+  border-radius: 4px; font-size: 11px; cursor: pointer;
+}
+.export button:hover { background: #f3f4f6; }
+.export button.primary {
+  border-color: #2563eb; background: #2563eb; color: #fff;
+}
+.export button.primary:hover { background: #1d4ed8; }
+
 .account .row {
   display: flex; align-items: center; gap: 6px; margin-bottom: 5px;
 }

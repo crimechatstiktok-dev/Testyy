@@ -273,6 +273,21 @@ async function startRun(opts = {}) {
     [STATE_KEYS.MAIL_TOKEN]: mailbox.token,
   });
 
+  // Append to permanent account history. This survives 'Clear' in the popup
+  // so the user never loses credentials. The popup exports it as a .txt.
+  try {
+    const stored = await chrome.storage.local.get("pv_accounts_history");
+    const history = Array.isArray(stored.pv_accounts_history) ? stored.pv_accounts_history : [];
+    const referral = (await chrome.storage.local.get("pv_referral_code")).pv_referral_code || "";
+    history.push({ ...account, referral });
+    // Cap at 1000 entries.
+    while (history.length > 1000) history.shift();
+    await chrome.storage.local.set({ pv_accounts_history: history });
+    log(`Account history: ${history.length} entry/entries stored`);
+  } catch (e) {
+    log(`history append failed: ${e.message}`);
+  }
+
   log(`Mailbox ready: ${account.email}`);
   log(`Username: ${account.username}`);
   await setStatus("mailbox-ready");

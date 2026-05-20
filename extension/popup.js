@@ -37,6 +37,64 @@ async function refresh() {
   const total = s.pv_repeat_total || parseInt($("f-repeat").value, 10) || 1;
   const done = s.pv_repeat_done || 0;
   $("f-progress").textContent = `${done} / ${total}`;
+
+  // Account history count.
+  const hist = await chrome.storage.local.get("pv_accounts_history");
+  const list = Array.isArray(hist.pv_accounts_history) ? hist.pv_accounts_history : [];
+  $("f-export-count").textContent = `${list.length} Account${list.length === 1 ? "" : "s"} gespeichert`;
+  $("btn-export").disabled = list.length === 0;
+  $("btn-history-clear").disabled = list.length === 0;
+}
+
+function pad(n, w) {
+  const s = String(n);
+  return s.length >= w ? s : " ".repeat(w - s.length) + s;
+}
+
+function formatAccountsTxt(list) {
+  const now = new Date().toISOString().replace("T", " ").slice(0, 19);
+  const lines = [];
+  lines.push("=".repeat(72));
+  lines.push("PixVerse Auto-Register - Account history");
+  lines.push(`Export: ${now}`);
+  lines.push(`Total : ${list.length}`);
+  lines.push("=".repeat(72));
+  lines.push("");
+  list.forEach((a, i) => {
+    const idx = pad(i + 1, 4);
+    const created = (a.createdAt || "").replace("T", " ").slice(0, 19);
+    lines.push(`[${idx}] ${created}`);
+    lines.push(`  Username     : ${a.username || ""}`);
+    lines.push(`  Email        : ${a.email || ""}`);
+    lines.push(`  Password     : ${a.password || ""}`);
+    lines.push(`  Mail.tm Pass : ${a.mailPassword || ""}`);
+    lines.push(`  Domain       : ${a.domain || ""}`);
+    if (a.referral) lines.push(`  Referral     : ${a.referral}`);
+    lines.push("");
+  });
+  return lines.join("\n");
+}
+
+async function exportAccounts() {
+  const hist = await chrome.storage.local.get("pv_accounts_history");
+  const list = Array.isArray(hist.pv_accounts_history) ? hist.pv_accounts_history : [];
+  if (!list.length) {
+    alert("Noch keine Accounts in der Historie.");
+    return;
+  }
+  const text = formatAccountsTxt(list);
+  const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `pixverse-accounts-${stamp}.txt`;
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => {
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }, 0);
 }
 
 document.addEventListener("DOMContentLoaded", () => {
@@ -111,8 +169,21 @@ document.addEventListener("DOMContentLoaded", () => {
   });
 
   $("btn-clear").addEventListener("click", async () => {
+    // Clear per-run state but PRESERVE the account history (and the user's
+    // referral / repeat-count preferences) so credentials are never lost.
+    const KEEP = ["pv_accounts_history", "pv_referral_code", "pv_repeat_total_pref"];
+    const keep = await chrome.storage.local.get(KEEP);
     await chrome.storage.local.clear();
+    await chrome.storage.local.set(keep);
     await chrome.runtime.sendMessage({ type: "PV_STOP" });
+    refresh();
+  });
+
+  $("btn-export").addEventListener("click", exportAccounts);
+
+  $("btn-history-clear").addEventListener("click", async () => {
+    if (!confirm("Wirklich die komplette Account-Historie loeschen? Das kann nicht rueckgaengig gemacht werden.")) return;
+    await chrome.storage.local.remove("pv_accounts_history");
     refresh();
   });
 
