@@ -111,7 +111,10 @@ async function mailTmCreateAccount(preferredDomain) {
   });
   if (createRes.status !== 201) {
     const txt = await createRes.text();
-    throw new Error(`mail.tm /accounts ${createRes.status}: ${txt.slice(0, 200)}`);
+    const err = new Error(`mail.tm /accounts ${createRes.status}: ${txt.slice(0, 200)}`);
+    err.status = createRes.status;
+    err.retryAfter = parseInt(createRes.headers.get("retry-after") || "0", 10);
+    throw err;
   }
 
   const tokenRes = await mailTmFetch("/token", {
@@ -120,10 +123,43 @@ async function mailTmCreateAccount(preferredDomain) {
   });
   if (!tokenRes.ok) {
     const txt = await tokenRes.text();
-    throw new Error(`mail.tm /token ${tokenRes.status}: ${txt.slice(0, 200)}`);
+    const err = new Error(`mail.tm /token ${tokenRes.status}: ${txt.slice(0, 200)}`);
+    err.status = tokenRes.status;
+    err.retryAfter = parseInt(tokenRes.headers.get("retry-after") || "0", 10);
+    throw err;
   }
   const tokenData = await tokenRes.json();
   return { address, password, token: tokenData.token, id: tokenData.id, domain };
+}
+
+// Retry wrapper: mail.tm rate-limits new account creation per IP. On 429 we
+// back off with increasing delays. Other errors fail fast.
+async function mailTmCreateAccountWithRetry(preferredDomain) {
+  // Backoff schedule in seconds. mail.tm typically needs ~30-60s between
+  // accounts from the same IP; we go up to 3min for resilience.
+  const backoffSec = [0, 30, 60, 90, 120, 180];
+  let lastErr;
+  for (let i = 0; i < backoffSec.length; i++) {
+    if (backoffSec[i] > 0) {
+      const wait = (lastErr && lastErr.retryAfter) ? Math.max(lastErr.retryAfter, backoffSec[i]) : backoffSec[i];
+      log(`mail.tm 429 backoff: waiting ${wait}s before retry ${i}/${backoffSec.length - 1}`);
+      await setStatus("rate-limited");
+      await new Promise((r) => setTimeout(r, wait * 1000));
+      await setStatus("creating-mailbox");
+    }
+    try {
+      return await mailTmCreateAccount(preferredDomain);
+    } catch (e) {
+      lastErr = e;
+      if (e.status === 429) {
+        log(`mail.tm: 429 on attempt ${i + 1}, will retry`);
+        continue;
+      }
+      // Non-rate-limit failure: don't retry, propagate.
+      throw e;
+    }
+  }
+  throw lastErr || new Error("mail.tm: exhausted retries");
 }
 
 async function mailTmListMessages(token) {
@@ -215,7 +251,7 @@ async function startRun(opts = {}) {
 
   let mailbox;
   try {
-    mailbox = await mailTmCreateAccount(opts.preferredDomain || "wshu.net");
+    mailbox = await mailTmCreateAccountWithRetry(opts.preferredDomain || "wshu.net");
   } catch (e) {
     log(`mail.tm error: ${e.message}`);
     await setStatus("error");
@@ -727,9 +763,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           sendResponse({ ok: true, done, total });
 
           if (done < total) {
-            // Pause a few seconds so the UI / mail.tm rate limiter recover,
-            // then start the next iteration.
-            const delaySec = 8;
+            // Pause between iterations. mail.tm rate-limits new accounts at
+            // roughly 1 per ~30-60s per IP; if we go faster we hit 429 and
+            // have to back off anyway. Stay safely above their threshold.
+            const delaySec = 35 + Math.floor(Math.random() * 10); // 35-45s
             log(`Next iteration in ${delaySec}s ...`);
             setTimeout(() => prepareNextRun(), delaySec * 1000);
           } else {
