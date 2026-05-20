@@ -19,6 +19,8 @@ const STATE_KEYS = {
   MAIL_TOKEN: "pv_mail_token",
   LAST_LOG: "pv_log",
   RUN_ACTIVE: "pv_run_active",
+  REPEAT_TOTAL: "pv_repeat_total",
+  REPEAT_DONE: "pv_repeat_done",
 };
 
 async function getState() {
@@ -179,10 +181,22 @@ function extractVerificationFromMessage(msg) {
 // Run orchestration
 // -----------------------------------------------------------------------------
 async function startRun(opts = {}) {
-  await chrome.storage.local.set({ [STATE_KEYS.LAST_LOG]: [] });
+  // Initialise repeat counters on the first run only. Subsequent iterations
+  // pass keepCounters:true and just increment pv_repeat_done after each
+  // successful claim.
+  if (!opts.keepCounters) {
+    const total = Math.max(1, parseInt(opts.repeatTotal, 10) || 1);
+    await chrome.storage.local.set({
+      [STATE_KEYS.REPEAT_TOTAL]: total,
+      [STATE_KEYS.REPEAT_DONE]: 0,
+      [STATE_KEYS.LAST_LOG]: [],
+    });
+    log(`Run started (target: ${total} iterations)`);
+  } else {
+    log(`Run started (continuation, iteration ${(await currentIter()) + 1})`);
+  }
   await chrome.storage.local.set({ [STATE_KEYS.RUN_ACTIVE]: true });
   await setStatus("creating-mailbox");
-  log("Run started");
 
   let mailbox;
   try {
@@ -231,11 +245,84 @@ async function startRun(opts = {}) {
   return { ok: true, account };
 }
 
+async function currentIter() {
+  return (await chrome.storage.local.get(STATE_KEYS.REPEAT_DONE))[STATE_KEYS.REPEAT_DONE] || 0;
+}
+
 async function stopRun() {
   await chrome.alarms.clear("pv-inbox-poll");
   await chrome.storage.local.set({ [STATE_KEYS.RUN_ACTIVE]: false });
   await setStatus("idle");
   log("Run stopped");
+}
+
+// -----------------------------------------------------------------------------
+// Repeat-loop: log out (purge cookies), navigate to /register, start new run.
+// -----------------------------------------------------------------------------
+async function clearPixverseCookies() {
+  let removed = 0;
+  try {
+    const sets = await Promise.all([
+      chrome.cookies.getAll({ domain: "pixverse.ai" }),
+      chrome.cookies.getAll({ domain: "app.pixverse.ai" }),
+      chrome.cookies.getAll({ domain: ".pixverse.ai" }),
+    ]);
+    const seen = new Set();
+    const all = [];
+    for (const list of sets) {
+      for (const c of list || []) {
+        const key = `${c.domain}|${c.path}|${c.name}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        all.push(c);
+      }
+    }
+    for (const c of all) {
+      const url = `${c.secure ? "https" : "http"}://${c.domain.replace(/^\./, "")}${c.path}`;
+      try {
+        await chrome.cookies.remove({ url, name: c.name, storeId: c.storeId });
+        removed++;
+      } catch (e) { /* keep going */ }
+    }
+  } catch (e) {
+    log(`cookie clear error: ${e.message}`);
+  }
+  log(`Cleared ${removed} cookies for pixverse.ai`);
+}
+
+async function prepareNextRun() {
+  const s = await getState();
+  if (!s[STATE_KEYS.RUN_ACTIVE]) {
+    log("Run was stopped externally, not starting next iteration");
+    return;
+  }
+
+  // Purge auth so we land on /register fresh.
+  await clearPixverseCookies();
+
+  // Drop per-iteration state but keep repeat counters.
+  await chrome.storage.local.remove([
+    STATE_KEYS.ACCOUNT,
+    STATE_KEYS.MAIL_TOKEN,
+    "pv_verification",
+  ]);
+
+  // Force-navigate the active pixverse tab to /register so the content script
+  // gets a fresh injection.
+  const tabs = await chrome.tabs.query({ url: "https://app.pixverse.ai/*" });
+  let tab = tabs[0];
+  if (!tab) {
+    tab = await chrome.tabs.create({ url: "https://app.pixverse.ai/register", active: true });
+  } else {
+    await chrome.tabs.update(tab.id, {
+      url: "https://app.pixverse.ai/register",
+      active: true,
+    });
+  }
+  // Wait for the navigation to settle before issuing PV_FILL_FORM.
+  await new Promise((r) => setTimeout(r, 2500));
+
+  await startRun({ keepCounters: true });
 }
 
 async function getOrCreatePixverseRegisterTab() {
@@ -347,6 +434,28 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           // For debugging from popup
           chrome.alarms.create("pv-inbox-poll", { when: Date.now() + 100 });
           sendResponse({ ok: true });
+          return;
+        }
+        case "PV_REWARD_COMPLETED": {
+          // Sent by content.js once the referral submit succeeded. Decide
+          // whether another iteration is needed.
+          const s = await getState();
+          const total = s[STATE_KEYS.REPEAT_TOTAL] || 1;
+          const done = (s[STATE_KEYS.REPEAT_DONE] || 0) + 1;
+          await chrome.storage.local.set({ [STATE_KEYS.REPEAT_DONE]: done });
+          log(`Iteration ${done}/${total} complete`);
+          sendResponse({ ok: true, done, total });
+
+          if (done < total) {
+            // Pause a few seconds so the UI / mail.tm rate limiter recover,
+            // then start the next iteration.
+            const delaySec = 8;
+            log(`Next iteration in ${delaySec}s ...`);
+            setTimeout(() => prepareNextRun(), delaySec * 1000);
+          } else {
+            log("All iterations done. Stopping.");
+            await stopRun();
+          }
           return;
         }
         default:

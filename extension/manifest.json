@@ -11,7 +11,8 @@
     "activeTab",
     "scripting",
     "notifications",
-    "alarms"
+    "alarms",
+    "cookies"
   ],
 
   "host_permissions": [

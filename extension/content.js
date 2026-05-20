@@ -544,6 +544,12 @@
 
     setStatus("done");
     logBg("Reward flow complete");
+
+    // Tell the background worker we are done so it can decide whether to
+    // start another iteration (when pv_repeat_total > pv_repeat_done).
+    try {
+      await chrome.runtime.sendMessage({ type: "PV_REWARD_COMPLETED" });
+    } catch (_) { /* background may be sleeping; harmless */ }
   }
 
   // ---------------------------------------------------------------------------

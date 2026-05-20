@@ -72,6 +72,18 @@ section h2 { font-size: 12px; margin: 0 0 8px; text-transform: uppercase; color:
 }
 .referral button:hover { background: #1d4ed8; }
 
+.repeat .row { display: flex; align-items: center; gap: 6px; }
+.repeat label { width: 90px; color: #6b7280; font-size: 11px; }
+.repeat input {
+  width: 80px; padding: 6px 8px; border: 1px solid #d1d5db; border-radius: 4px;
+  font-family: ui-monospace, monospace; font-size: 12px; text-align: center;
+}
+.repeat .progress {
+  margin-left: auto; padding: 4px 10px; border-radius: 999px;
+  background: #e5e7eb; color: #374151; font-size: 11px;
+  font-family: ui-monospace, monospace;
+}
+
 .account .row {
   display: flex; align-items: center; gap: 6px; margin-bottom: 5px;
 }

@@ -31,6 +31,12 @@ async function refresh() {
   setPill(s.pv_status || "idle");
   fillAccount(s.pv_account || {});
   renderLog(s.pv_log || []);
+
+  // Progress bubble: e.g. "2 / 5". When idle and no run started yet, mirror
+  // the current input value as the target.
+  const total = s.pv_repeat_total || parseInt($("f-repeat").value, 10) || 1;
+  const done = s.pv_repeat_done || 0;
+  $("f-progress").textContent = `${done} / ${total}`;
 }
 
 document.addEventListener("DOMContentLoaded", () => {
@@ -46,6 +52,18 @@ document.addEventListener("DOMContentLoaded", () => {
     const v = (e.target.value || "").trim().toUpperCase();
     e.target.value = v;
     chrome.storage.local.set({ pv_referral_code: v || "Q1XJSEBM" });
+  });
+
+  // Load stored repeat count (default 1).
+  chrome.storage.local.get("pv_repeat_total_pref").then((s) => {
+    $("f-repeat").value = Math.max(1, parseInt(s.pv_repeat_total_pref, 10) || 1);
+  });
+
+  // Persist repeat preference on each change.
+  $("f-repeat").addEventListener("input", (e) => {
+    const v = Math.max(1, Math.min(100, parseInt(e.target.value, 10) || 1));
+    e.target.value = v;
+    chrome.storage.local.set({ pv_repeat_total_pref: v });
   });
 
   // Manual "Claim" trigger (sends a message to the active pixverse tab).
@@ -70,7 +88,11 @@ document.addEventListener("DOMContentLoaded", () => {
   $("btn-start").addEventListener("click", async () => {
     $("btn-start").disabled = true;
     try {
-      const r = await chrome.runtime.sendMessage({ type: "PV_START", opts: {} });
+      const repeatTotal = Math.max(1, parseInt($("f-repeat").value, 10) || 1);
+      const r = await chrome.runtime.sendMessage({
+        type: "PV_START",
+        opts: { repeatTotal },
+      });
       if (!r.ok) alert("Start fehlgeschlagen: " + r.error);
     } finally {
       $("btn-start").disabled = false;
