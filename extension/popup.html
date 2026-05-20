@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8" />
+  <title>PixVerse Auto-Register</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <header>
+    <h1>PixVerse Auto-Register</h1>
+    <span id="status-pill" class="pill">idle</span>
+  </header>
+
+  <section class="controls">
+    <button id="btn-start" class="primary">Registrierung starten</button>
+    <button id="btn-stop">Stop</button>
+    <button id="btn-poll" title="Inbox jetzt abfragen">Inbox jetzt</button>
+    <button id="btn-clear">Clear</button>
+  </section>
+
+  <section class="account">
+    <h2>Account</h2>
+    <div class="row"><label>Username</label><input id="f-user" readonly /><button class="copy" data-target="f-user">Kopieren</button></div>
+    <div class="row"><label>E-Mail</label><input id="f-mail" readonly /><button class="copy" data-target="f-mail">Kopieren</button></div>
+    <div class="row"><label>Passwort</label><input id="f-pass" readonly /><button class="copy" data-target="f-pass">Kopieren</button></div>
+    <div class="row"><label>mail.tm Pass</label><input id="f-mailpass" readonly /><button class="copy" data-target="f-mailpass">Kopieren</button></div>
+    <div class="row"><label>Domain</label><input id="f-domain" readonly /></div>
+  </section>
+
+  <section class="logs">
+    <h2>Log</h2>
+    <pre id="log"></pre>
+  </section>
+
+  <footer>
+    <small>v1.0 - mail.tm + passive Turnstile</small>
+  </footer>
+
+  <script src="popup.js"></script>
+</body>
+</html>

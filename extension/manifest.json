@@ -1,0 +1,44 @@
+{
+  "manifest_version": 3,
+  "name": "PixVerse Auto-Register",
+  "version": "1.0.0",
+  "description": "Automatisiert die Registrierung auf app.pixverse.ai mit temporaerer E-Mail (mail.tm). Turnstile loest sich passiv im echten Profil.",
+  "default_locale": "en",
+  "minimum_chrome_version": "120",
+
+  "permissions": [
+    "storage",
+    "tabs",
+    "activeTab",
+    "scripting",
+    "notifications",
+    "alarms"
+  ],
+
+  "host_permissions": [
+    "https://app.pixverse.ai/*",
+    "https://api.mail.tm/*"
+  ],
+
+  "background": {
+    "service_worker": "background.js"
+  },
+
+  "action": {
+    "default_title": "PixVerse Auto-Register",
+    "default_popup": "popup.html"
+  },
+
+  "content_scripts": [
+    {
+      "matches": [
+        "https://app.pixverse.ai/register*",
+        "https://app.pixverse.ai/verify*",
+        "https://app.pixverse.ai/login*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ]
+}
