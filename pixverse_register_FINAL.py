@@ -88,6 +88,147 @@ class MailTM:
                 return await r.json()
 
 
+async def solve_turnstile(page, max_wait=120):
+    """
+    Versucht Cloudflare Turnstile automatisch zu lösen.
+    
+    WICHTIG: Diese Funktion wird NACH dem Continue-Klick aufgerufen,
+    weil Turnstile bei PixVerse erst nach diesem Klick erscheint.
+    """
+    print("    Schritt 1: Warte auf Turnstile-iframe (max 30s)...")
+    
+    # Warte bis das Turnstile-iframe erscheint
+    turnstile_frame = None
+    for i in range(15):
+        frames = page.frames
+        for frame in frames:
+            if "challenges.cloudflare.com" in frame.url:
+                turnstile_frame = frame
+                print(f"    [✓] iframe gefunden nach {i*2}s")
+                break
+        
+        if turnstile_frame:
+            break
+        
+        # Auch nach data-sitekey suchen (Container)
+        widget = await page.evaluate("""() => {
+            const el = document.querySelector('[data-sitekey], iframe[src*="challenges.cloudflare"], iframe[src*="turnstile"]');
+            if (el) {
+                const rect = el.getBoundingClientRect();
+                return {x: rect.x, y: rect.y, w: rect.width, h: rect.height};
+            }
+            return null;
+        }""")
+        
+        if widget and widget["w"] > 0:
+            print(f"    [✓] Widget Element gefunden: ({widget['x']:.0f},{widget['y']:.0f}) {widget['w']:.0f}x{widget['h']:.0f}")
+            break
+        
+        await asyncio.sleep(2)
+    
+    # Phase 2: Versuche zu klicken
+    print("    Schritt 2: Suche Klickposition...")
+    
+    try:
+        # Hole die Position des Turnstile-Widgets
+        widget_pos = await page.evaluate("""() => {
+            // Versuche verschiedene Selektoren
+            const selectors = [
+                'iframe[src*="challenges.cloudflare.com"]',
+                'iframe[src*="turnstile"]',
+                '[data-sitekey]',
+                'div[class*="cf-turnstile"]',
+                'div[class*="turnstile"]'
+            ];
+            
+            for (const sel of selectors) {
+                const el = document.querySelector(sel);
+                if (el) {
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width > 0 && rect.height > 0) {
+                        return {
+                            selector: sel,
+                            x: rect.x,
+                            y: rect.y,
+                            width: rect.width,
+                            height: rect.height
+                        };
+                    }
+                }
+            }
+            return null;
+        }""")
+        
+        if widget_pos:
+            print(f"    [✓] Widget bei ({widget_pos['x']:.0f},{widget_pos['y']:.0f}) {widget_pos['width']:.0f}x{widget_pos['height']:.0f}")
+            
+            # Bei Turnstile ist die Checkbox links im Widget
+            # Standardmäßig bei x+30, y+zentral
+            target_x = widget_pos["x"] + 30
+            target_y = widget_pos["y"] + widget_pos["height"] / 2
+            
+            print(f"    Bewege Maus zu ({target_x:.0f}, {target_y:.0f})")
+            
+            # Menschliche Mausbewegung
+            await asyncio.sleep(0.5)
+            await page.mouse.move(target_x - 200, target_y - 100, steps=15)
+            await asyncio.sleep(0.3)
+            await page.mouse.move(target_x - 50, target_y - 20, steps=10)
+            await asyncio.sleep(0.2)
+            await page.mouse.move(target_x, target_y, steps=8)
+            await asyncio.sleep(0.5)
+            
+            # Klicken
+            await page.mouse.click(target_x, target_y)
+            print(f"    [✓] Klick auf Turnstile-Widget")
+            
+            await asyncio.sleep(3)
+        else:
+            print("    [INFO] Kein sichtbares Widget - versuche iframe direkt")
+            
+            # Fallback: Versuche im iframe zu klicken
+            for frame in page.frames:
+                if "challenges.cloudflare.com" in frame.url:
+                    try:
+                        # Versuche alle möglichen Elemente
+                        for sel in ["input[type='checkbox']", "label", "#challenge-stage", 
+                                   "div[role='button']", "button", "[tabindex='0']"]:
+                            try:
+                                el = await frame.wait_for_selector(sel, timeout=2000)
+                                if el:
+                                    await el.click(force=True, timeout=3000)
+                                    print(f"    [✓] Klick auf '{sel}' im iframe")
+                                    await asyncio.sleep(3)
+                                    break
+                            except:
+                                continue
+                    except Exception as e:
+                        print(f"    [WARN] iframe-Klick: {e}")
+                    break
+        
+    except Exception as e:
+        print(f"    [WARN] Fehler beim Klicken: {e}")
+    
+    # Phase 3: Warte auf Token
+    print("    Schritt 3: Warte auf Turnstile-Token (max 60s)...")
+    
+    for i in range(30):
+        token = await page.evaluate("""() => {
+            const inp = document.querySelector('input[name="cf-turnstile-response"]');
+            return inp ? inp.value : null;
+        }""")
+        
+        if token and len(token) > 10:
+            print(f"    [✓] Token erhalten nach {i*2}s!")
+            return True
+        
+        await asyncio.sleep(2)
+        if i % 10 == 9:
+            print(f"    ... warte ({(i+1)*2}s)")
+    
+    return False
+
+
 async def main():
     print("=" * 70)
     print("PixVerse AI Registrierung - Automatisch")
@@ -184,36 +325,30 @@ async def main():
                 print(f"    Passwort: {password}")
             
             # Warte auf Cloudflare Turnstile
-            print("\n[4] Warte auf Cloudflare Turnstile...")
-            print("    (Auf Desktop löst sich das automatisch in 5-30 Sekunden)")
+            print("\n[4] Klicke 'Continue/Weiter' (triggert Turnstile)...")
+            btn = await page.query_selector("button:has-text('Continue'), button:has-text('Weiter')")
+            if btn:
+                await btn.click()
+                print("    [✓] Continue geklickt")
             
-            turnstile_solved = False
-            for i in range(60):  # Max 2 Minuten
-                token = await page.evaluate("""() => {
-                    const inp = document.querySelector('input[name="cf-turnstile-response"]');
-                    return inp ? inp.value : null;
-                }""")
-                
-                if token and len(token) > 10:
-                    print(f"    [✓] Turnstile gelöst nach {i*2}s!")
-                    turnstile_solved = True
-                    break
-                
-                await asyncio.sleep(2)
-                if i % 10 == 9:
-                    print(f"    ... noch nicht gelöst ({(i+1)*2}s)")
+            await asyncio.sleep(2)
+            
+            # Jetzt sollte Turnstile erscheinen
+            print("\n[5] Versuche Cloudflare Turnstile zu lösen...")
+            
+            turnstile_solved = await solve_turnstile(page)
             
             if not turnstile_solved:
                 print("    [⚠️] Turnstile nicht automatisch gelöst")
                 print("    Bitte löse das Captcha manuell im Browser!")
                 input("    Drücke Enter wenn das Captcha gelöst ist...")
             
-            # Submit
-            print("\n[5] Klicke 'Continue/Weiter'...")
+            # Falls Continue nochmal geklickt werden muss
+            print("\n[6] Klicke Continue nochmal (falls nötig)...")
             btn = await page.query_selector("button:has-text('Continue'), button:has-text('Weiter')")
-            if btn:
+            if btn and not (await btn.is_disabled()):
                 await btn.click()
-                print("    [✓] Geklickt")
+                print("    [✓] Erneut geklickt")
             
             await asyncio.sleep(5)
             print(f"    URL: {page.url}")
