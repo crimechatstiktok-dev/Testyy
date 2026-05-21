@@ -169,24 +169,66 @@ async function startGenerations() {
     if (!confirm(`Anzahl Prompts (${prompts.length}) != Anzahl Bilder (${pickedImages.length}). Trotzdem starten? Es wird die kleinere Menge verarbeitet.`)) return;
   }
   const n = Math.min(prompts.length, pickedImages.length);
+
+  // Build LIGHTWEIGHT metadata only - no imageDataUri here. Image bytes are
+  // streamed to the background separately (one message per image) so we
+  // never put them in chrome.storage.local (10 MB QUOTA_BYTES limit) and
+  // also avoid one giant runtime.sendMessage payload.
   const items = [];
   for (let i = 0; i < n; i++) {
     items.push({
+      index: i,
       prompt: prompts[i],
       imageName: pickedImages[i].name,
-      imageDataUri: pickedImages[i].dataUri,
     });
   }
   const perAccount = Math.max(1, Math.min(10, parseInt($("f-gen-per-account").value, 10) || 3));
-  const r = await chrome.runtime.sendMessage({
-    type: "PV_START_GENERATIONS",
-    opts: { items, perAccount },
-  });
-  if (!r || !r.ok) {
-    alert("Generierungen-Start fehlgeschlagen: " + (r?.error || "unknown"));
-    return;
+
+  const btn = $("btn-gen-start");
+  const origText = btn.textContent;
+  btn.disabled = true;
+  try {
+    // 1) Reset any leftover bytes from a previous (cancelled) batch.
+    await chrome.runtime.sendMessage({ type: "PV_GEN_IMAGES_RESET" });
+
+    // 2) Stream each image one-by-one. Each message stays well below any
+    //    runtime.sendMessage size limits and the bg keeps the bytes in an
+    //    in-memory Map, NOT in chrome.storage.local.
+    for (let i = 0; i < n; i++) {
+      btn.textContent = `Sende Bild ${i + 1}/${n}...`;
+      let r;
+      try {
+        r = await chrome.runtime.sendMessage({
+          type: "PV_GEN_IMAGE_CHUNK",
+          index: i,
+          name: pickedImages[i].name,
+          dataUri: pickedImages[i].dataUri,
+        });
+      } catch (e) {
+        alert(`Bild ${i + 1} (${pickedImages[i].name}) konnte nicht gesendet werden: ${e.message}`);
+        return;
+      }
+      if (!r || !r.ok) {
+        alert(`Bild ${i + 1} (${pickedImages[i].name}) konnte nicht gesendet werden: ${r?.error || "unknown"}`);
+        return;
+      }
+    }
+
+    // 3) Now kick off the queue with text-only metadata.
+    btn.textContent = origText;
+    const r = await chrome.runtime.sendMessage({
+      type: "PV_START_GENERATIONS",
+      opts: { items, perAccount },
+    });
+    if (!r || !r.ok) {
+      alert("Generierungen-Start fehlgeschlagen: " + (r?.error || "unknown"));
+      return;
+    }
+    refresh();
+  } finally {
+    btn.disabled = false;
+    btn.textContent = origText;
   }
-  refresh();
 }
 
 document.addEventListener("DOMContentLoaded", () => {

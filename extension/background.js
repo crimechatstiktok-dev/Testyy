@@ -37,6 +37,22 @@ const STATE_KEYS = {
 // Per-generation cost (PixVerse V6 image-to-video at the listed quality).
 const PV_GENERATION_COST = 60;
 
+// -----------------------------------------------------------------------------
+// In-memory image buffer for the generations queue.
+// -----------------------------------------------------------------------------
+// We deliberately do NOT persist image bytes in chrome.storage.local: a
+// couple of phone-camera JPEGs base64-encoded into a single set() blow past
+// the 10 MB QUOTA_BYTES limit ("QuotaBytes exceeded"). Instead the popup
+// streams each image to the service worker via PV_GEN_IMAGE_CHUNK messages
+// and we keep them here until the queue consumes them. Trade-off: if the
+// service worker is evicted mid-batch, the buffer is lost and the user has
+// to restart the generation. The persistent queue (pv_gen_queue) holds only
+// lightweight metadata (index, prompt, imageName), so the queue itself is
+// always recoverable; only the bytes are volatile.
+//
+// Key: item index (number). Value: { name, dataUri }.
+const genImages = new Map();
+
 async function getState() {
   return await chrome.storage.local.get(Object.values(STATE_KEYS));
 }
@@ -1395,11 +1411,29 @@ async function runGenerationInTab(tab, item) {
 // Generations queue runner
 // -----------------------------------------------------------------------------
 async function startGenerationsBatch(opts) {
-  const items = Array.isArray(opts.items) ? opts.items : [];
-  if (!items.length) {
+  const itemsRaw = Array.isArray(opts.items) ? opts.items : [];
+  if (!itemsRaw.length) {
     log("Generations: empty queue");
     return { ok: false, error: "no items" };
   }
+  // Defensive: strip any image bytes the popup might still attach. The
+  // queue we persist must stay small (text-only metadata), otherwise we hit
+  // QUOTA_BYTES on chrome.storage.local. The actual bytes live in the
+  // in-memory genImages Map, populated via PV_GEN_IMAGE_CHUNK before this
+  // call.
+  const items = itemsRaw.map((it, i) => ({
+    index: typeof it.index === "number" ? it.index : i,
+    prompt: it.prompt || "",
+    imageName: it.imageName || "",
+  }));
+
+  // Sanity-check: every item must have its bytes already buffered.
+  const missing = items.filter((it) => !genImages.has(it.index));
+  if (missing.length) {
+    log(`Generations: ${missing.length} image(s) missing in buffer (indices=${missing.map((m) => m.index).join(",")})`);
+    return { ok: false, error: `missing image data for ${missing.length} item(s)` };
+  }
+
   const perAccount = Math.max(1, parseInt(opts.perAccount, 10) || 3);
   await chrome.storage.local.set({
     [STATE_KEYS.GEN_ACTIVE]: true,
@@ -1409,7 +1443,7 @@ async function startGenerationsBatch(opts) {
     [STATE_KEYS.GEN_PER_ACCOUNT]: perAccount,
     [STATE_KEYS.LAST_LOG]: [],
   });
-  log(`Generations queued: ${items.length} items, ${perAccount} per account`);
+  log(`Generations queued: ${items.length} items, ${perAccount} per account, ${genImages.size} image(s) in memory`);
   // Kick off the first step.
   await chrome.alarms.clear("pv-generations-step");
   await chrome.alarms.create("pv-generations-step", { when: Date.now() + 100 });
@@ -1419,6 +1453,9 @@ async function startGenerationsBatch(opts) {
 async function stopGenerations() {
   await chrome.alarms.clear("pv-generations-step");
   await chrome.storage.local.set({ [STATE_KEYS.GEN_ACTIVE]: false });
+  // Drop any image bytes still buffered. They are NOT persisted, so this
+  // is the only place they need to be released.
+  genImages.clear();
   await setStatus("idle");
   log("Generations stopped");
 }
@@ -1503,7 +1540,27 @@ async function generationsStep() {
     const promptPreview = (item.prompt || "").slice(0, 80).replace(/\n/g, " ");
     log(`[gen] #${idx} ${acc.email} <- ${item.imageName || "<unnamed>"} | ${promptPreview}`);
 
-    const res = await runGenerationInTab(loginRes.tab, item);
+    // Look up the image bytes from the in-memory buffer (NOT from the
+    // persisted queue, which only has metadata to keep storage small).
+    const img = genImages.get(item.index);
+    if (!img || !img.dataUri) {
+      // This means the SW was evicted between the popup streaming the
+      // chunks and this step. The queue survived but the bytes did not -
+      // skip with a clear error so the user knows to restart the batch.
+      failures++;
+      log(`[gen] FAIL #${idx}: image bytes not in memory (SW restart?) - drop item (failures=${failures})`);
+      queue.shift();
+      await chrome.storage.local.set({ [STATE_KEYS.GEN_QUEUE]: queue });
+      if (failures >= 2) break;
+      continue;
+    }
+    const itemForRun = {
+      prompt: item.prompt,
+      imageName: img.name || item.imageName,
+      imageDataUri: img.dataUri,
+    };
+
+    const res = await runGenerationInTab(loginRes.tab, itemForRun);
     if (!res.ok) {
       failures++;
       log(`[gen] FAIL #${idx}: ${res.reason || "unknown"} (failures=${failures})`);
@@ -1516,7 +1573,9 @@ async function generationsStep() {
       continue;
     }
 
-    // Success: pop item, log to gen-history, update counters.
+    // Success: pop item, free its bytes from the buffer, log to gen-history,
+    // update counters.
+    genImages.delete(item.index);
     queue.shift();
     did++;
     failures = 0;
@@ -2035,6 +2094,29 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         case "PV_START_GENERATIONS": {
           const r = await startGenerationsBatch(msg.opts || {});
           sendResponse(r);
+          return;
+        }
+        case "PV_GEN_IMAGE_CHUNK": {
+          // Streamed from the popup, one image per message, BEFORE
+          // PV_START_GENERATIONS arrives. We hold them in-memory only,
+          // never in chrome.storage.local (would blow QUOTA_BYTES).
+          if (typeof msg.index !== "number" || typeof msg.dataUri !== "string") {
+            sendResponse({ ok: false, error: "bad chunk payload" });
+            return;
+          }
+          genImages.set(msg.index, {
+            name: msg.name || `image-${msg.index}`,
+            dataUri: msg.dataUri,
+          });
+          sendResponse({ ok: true, count: genImages.size });
+          return;
+        }
+        case "PV_GEN_IMAGES_RESET": {
+          // Called by the popup right before it streams a fresh batch, so
+          // leftover bytes from a previous (cancelled) batch are not
+          // reused.
+          genImages.clear();
+          sendResponse({ ok: true });
           return;
         }
         case "PV_STOP_GENERATIONS": {
