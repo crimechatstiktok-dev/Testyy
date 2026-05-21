@@ -24,6 +24,10 @@ function renderLog(lines) {
   pre.scrollTop = pre.scrollHeight;
 }
 
+// In-popup buffer of files the user picked. Not persisted; selecting again
+// replaces the buffer.
+let pickedImages = []; // [{ name, dataUri }]
+
 async function refresh() {
   const r = await chrome.runtime.sendMessage({ type: "PV_GET_STATE" });
   if (!r || !r.ok) return;
@@ -32,13 +36,17 @@ async function refresh() {
   fillAccount(s.pv_account || {});
   renderLog(s.pv_log || []);
 
-  // Progress bubble: e.g. "2 / 5". When idle and no run started yet, mirror
-  // the current input value as the target.
+  // Repeat progress.
   const total = s.pv_repeat_total || parseInt($("f-repeat").value, 10) || 1;
   const done = s.pv_repeat_done || 0;
   $("f-progress").textContent = `${done} / ${total}`;
 
-  // Account history count.
+  // Generation progress.
+  const gTotal = s.pv_gen_total || 0;
+  const gDone = s.pv_gen_done || 0;
+  $("f-gen-progress").textContent = `${gDone} / ${gTotal}`;
+
+  // History count.
   const hist = await chrome.storage.local.get("pv_accounts_history");
   const list = Array.isArray(hist.pv_accounts_history) ? hist.pv_accounts_history : [];
   $("f-export-count").textContent = `${list.length} Account${list.length === 1 ? "" : "s"} gespeichert`;
@@ -70,6 +78,9 @@ function formatAccountsTxt(list) {
     lines.push(`  Mail.tm Pass : ${a.mailPassword || ""}`);
     lines.push(`  Domain       : ${a.domain || ""}`);
     if (a.referral) lines.push(`  Referral     : ${a.referral}`);
+    if (typeof a.credits === "number") lines.push(`  Credits      : ${a.credits}`);
+    if (a.lastChecked) lines.push(`  LastChecked  : ${(a.lastChecked || "").replace("T", " ").slice(0, 19)}`);
+    if (a.loginFailed) lines.push(`  LoginFailed  : true`);
     lines.push("");
   });
   return lines.join("\n");
@@ -97,65 +108,135 @@ async function exportAccounts() {
   }, 0);
 }
 
+// Split a textarea full of CLIP blocks into individual prompts. Heuristic:
+// split before each line that matches /^CLIP\s*\d/ (case-insensitive). Each
+// chunk is the full text of one prompt, headers preserved. Empty/short chunks
+// are filtered out.
+function parsePrompts(text) {
+  const lines = (text || "").split(/\r?\n/);
+  const blocks = [];
+  let current = [];
+  for (const line of lines) {
+    if (/^\s*CLIP\s*\d/i.test(line) && current.length) {
+      blocks.push(current.join("\n").trim());
+      current = [];
+    }
+    current.push(line);
+  }
+  if (current.length) blocks.push(current.join("\n").trim());
+  return blocks.filter((b) => b.length >= 20);
+}
+
+function fileToDataUri(file) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(r.result);
+    r.onerror = () => reject(r.error || new Error("file read failed"));
+    r.readAsDataURL(file);
+  });
+}
+
+async function onImagesPicked(ev) {
+  const files = Array.from(ev.target.files || []);
+  pickedImages = [];
+  for (const f of files) {
+    try {
+      const data = await fileToDataUri(f);
+      pickedImages.push({ name: f.name, dataUri: data });
+    } catch (e) {
+      console.warn("file read failed", f.name, e);
+    }
+  }
+  updateGenCounts();
+}
+
+function updateGenCounts() {
+  const prompts = parsePrompts($("f-gen-prompts").value);
+  $("f-gen-counts").textContent = `${prompts.length} Prompts · ${pickedImages.length} Bilder`;
+}
+
+async function startGenerations() {
+  const prompts = parsePrompts($("f-gen-prompts").value);
+  if (!prompts.length) { alert("Keine Prompts gefunden. Tipp: jeden Prompt mit 'CLIP N' beginnen lassen."); return; }
+  if (!pickedImages.length) { alert("Keine Bilder ausgewaehlt."); return; }
+  if (prompts.length !== pickedImages.length) {
+    if (!confirm(`Anzahl Prompts (${prompts.length}) != Anzahl Bilder (${pickedImages.length}). Trotzdem starten? Es wird die kleinere Menge verarbeitet.`)) return;
+  }
+  const n = Math.min(prompts.length, pickedImages.length);
+  const items = [];
+  for (let i = 0; i < n; i++) {
+    items.push({
+      prompt: prompts[i],
+      imageName: pickedImages[i].name,
+      imageDataUri: pickedImages[i].dataUri,
+    });
+  }
+  const perAccount = Math.max(1, Math.min(10, parseInt($("f-gen-per-account").value, 10) || 3));
+  const r = await chrome.runtime.sendMessage({
+    type: "PV_START_GENERATIONS",
+    opts: { items, perAccount },
+  });
+  if (!r || !r.ok) {
+    alert("Generierungen-Start fehlgeschlagen: " + (r?.error || "unknown"));
+    return;
+  }
+  refresh();
+}
+
 document.addEventListener("DOMContentLoaded", () => {
   refresh();
 
-  // Load stored referral code (default Q1XJSEBM).
   chrome.storage.local.get("pv_referral_code").then((s) => {
     $("f-referral").value = (s.pv_referral_code || "Q1XJSEBM").toUpperCase();
   });
-
-  // Persist referral code on each change.
   $("f-referral").addEventListener("input", (e) => {
     const v = (e.target.value || "").trim().toUpperCase();
     e.target.value = v;
     chrome.storage.local.set({ pv_referral_code: v || "Q1XJSEBM" });
   });
 
-  // Load stored repeat count (default 1).
   chrome.storage.local.get("pv_repeat_total_pref").then((s) => {
     $("f-repeat").value = Math.max(1, parseInt(s.pv_repeat_total_pref, 10) || 1);
   });
-
-  // Persist repeat preference on each change.
   $("f-repeat").addEventListener("input", (e) => {
     const v = Math.max(1, Math.min(100, parseInt(e.target.value, 10) || 1));
     e.target.value = v;
     chrome.storage.local.set({ pv_repeat_total_pref: v });
   });
 
-  // Manual "Claim" trigger (sends a message to the active pixverse tab).
+  chrome.storage.local.get("pv_gen_per_account_pref").then((s) => {
+    $("f-gen-per-account").value = Math.max(1, parseInt(s.pv_gen_per_account_pref, 10) || 3);
+  });
+  $("f-gen-per-account").addEventListener("input", (e) => {
+    const v = Math.max(1, Math.min(10, parseInt(e.target.value, 10) || 3));
+    e.target.value = v;
+    chrome.storage.local.set({ pv_gen_per_account_pref: v });
+  });
+
+  $("f-gen-prompts").addEventListener("input", updateGenCounts);
+  $("f-gen-images").addEventListener("change", onImagesPicked);
+  $("btn-gen-start").addEventListener("click", startGenerations);
+  $("btn-gen-stop").addEventListener("click", async () => {
+    await chrome.runtime.sendMessage({ type: "PV_STOP_GENERATIONS" });
+    refresh();
+  });
+
   $("btn-claim").addEventListener("click", async () => {
     const tabs = await chrome.tabs.query({ url: "https://app.pixverse.ai/*", active: true, currentWindow: true });
     let tab = tabs[0];
-    if (!tab) {
-      const all = await chrome.tabs.query({ url: "https://app.pixverse.ai/*" });
-      tab = all[0];
-    }
-    if (!tab) {
-      alert("Kein PixVerse-Tab offen.");
-      return;
-    }
-    try {
-      await chrome.tabs.sendMessage(tab.id, { type: "PV_CLAIM_REFERRAL_NOW" });
-    } catch (e) {
-      alert("Konnte den Tab nicht ansprechen: " + e.message);
-    }
+    if (!tab) { const all = await chrome.tabs.query({ url: "https://app.pixverse.ai/*" }); tab = all[0]; }
+    if (!tab) { alert("Kein PixVerse-Tab offen."); return; }
+    try { await chrome.tabs.sendMessage(tab.id, { type: "PV_CLAIM_REFERRAL_NOW" }); }
+    catch (e) { alert("Konnte den Tab nicht ansprechen: " + e.message); }
   });
 
   $("btn-start").addEventListener("click", async () => {
     $("btn-start").disabled = true;
     try {
       const repeatTotal = Math.max(1, parseInt($("f-repeat").value, 10) || 1);
-      const r = await chrome.runtime.sendMessage({
-        type: "PV_START",
-        opts: { repeatTotal },
-      });
+      const r = await chrome.runtime.sendMessage({ type: "PV_START", opts: { repeatTotal } });
       if (!r.ok) alert("Start fehlgeschlagen: " + r.error);
-    } finally {
-      $("btn-start").disabled = false;
-      refresh();
-    }
+    } finally { $("btn-start").disabled = false; refresh(); }
   });
 
   $("btn-stop").addEventListener("click", async () => {
@@ -169,18 +250,16 @@ document.addEventListener("DOMContentLoaded", () => {
   });
 
   $("btn-clear").addEventListener("click", async () => {
-    // Clear per-run state but PRESERVE the account history (and the user's
-    // referral / repeat-count preferences) so credentials are never lost.
-    const KEEP = ["pv_accounts_history", "pv_referral_code", "pv_repeat_total_pref"];
+    const KEEP = ["pv_accounts_history", "pv_referral_code", "pv_repeat_total_pref", "pv_gen_per_account_pref"];
     const keep = await chrome.storage.local.get(KEEP);
     await chrome.storage.local.clear();
     await chrome.storage.local.set(keep);
     await chrome.runtime.sendMessage({ type: "PV_STOP" });
+    await chrome.runtime.sendMessage({ type: "PV_STOP_GENERATIONS" });
     refresh();
   });
 
   $("btn-export").addEventListener("click", exportAccounts);
-
   $("btn-history-clear").addEventListener("click", async () => {
     if (!confirm("Wirklich die komplette Account-Historie loeschen? Das kann nicht rueckgaengig gemacht werden.")) return;
     await chrome.storage.local.remove("pv_accounts_history");
@@ -198,12 +277,7 @@ document.addEventListener("DOMContentLoaded", () => {
     });
   });
 
-  // Live updates while popup is open.
   const live = setInterval(refresh, 1500);
   window.addEventListener("unload", () => clearInterval(live));
-
-  // Listen for storage changes to update immediately.
-  chrome.storage.onChanged.addListener((_changes, area) => {
-    if (area === "local") refresh();
-  });
+  chrome.storage.onChanged.addListener((_changes, area) => { if (area === "local") refresh(); });
 });

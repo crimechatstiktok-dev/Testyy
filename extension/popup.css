@@ -5,7 +5,7 @@ html, body {
   font-size: 13px;
   color: #1a1a1a;
   background: #fafafa;
-  width: 380px;
+  width: 420px;
 }
 
 header {
@@ -27,6 +27,8 @@ header h1 { font-size: 14px; margin: 0; font-weight: 600; }
 }
 .pill.idle { background: #6b7280; }
 .pill.logging-out { background: #7c3aed; }
+.pill.logging-in,
+.pill.picking-account { background: #0ea5e9; }
 .pill.rate-limited { background: #92400e; }
 .pill.creating-mailbox,
 .pill.mailbox-ready,
@@ -74,17 +76,30 @@ section h2 { font-size: 12px; margin: 0 0 8px; text-transform: uppercase; color:
 }
 .referral button:hover { background: #1d4ed8; }
 
-.repeat .row { display: flex; align-items: center; gap: 6px; }
-.repeat label { width: 90px; color: #6b7280; font-size: 11px; }
-.repeat input {
+.repeat .row, .gen .row { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; }
+.repeat label, .gen label { width: 90px; color: #6b7280; font-size: 11px; }
+.repeat input, .gen input[type="number"] {
   width: 80px; padding: 6px 8px; border: 1px solid #d1d5db; border-radius: 4px;
   font-family: ui-monospace, monospace; font-size: 12px; text-align: center;
 }
-.repeat .progress {
+.repeat .progress, .gen .progress {
   margin-left: auto; padding: 4px 10px; border-radius: 999px;
   background: #e5e7eb; color: #374151; font-size: 11px;
   font-family: ui-monospace, monospace;
 }
+.gen textarea {
+  width: 100%; min-height: 80px; padding: 6px 8px;
+  border: 1px solid #d1d5db; border-radius: 4px;
+  font-family: ui-monospace, monospace; font-size: 11px;
+  resize: vertical;
+}
+.gen input[type="file"] { font-size: 11px; }
+.gen button {
+  padding: 7px 10px; border: 1px solid #d1d5db; background: #fff;
+  border-radius: 5px; font-size: 12px; cursor: pointer;
+}
+.gen button.primary { background: #2563eb; color: #fff; border-color: #2563eb; }
+.gen button.primary:hover { background: #1d4ed8; }
 
 .export .row { display: flex; align-items: center; gap: 6px; }
 .export-count {

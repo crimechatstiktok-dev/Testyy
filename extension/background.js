@@ -21,7 +21,15 @@ const STATE_KEYS = {
   RUN_ACTIVE: "pv_run_active",
   REPEAT_TOTAL: "pv_repeat_total",
   REPEAT_DONE: "pv_repeat_done",
+  GEN_ACTIVE: "pv_gen_active",
+  GEN_QUEUE: "pv_gen_queue",        // [{ prompt, imageDataUri }]
+  GEN_DONE: "pv_gen_done",          // count
+  GEN_TOTAL: "pv_gen_total",        // count
+  GEN_PER_ACCOUNT: "pv_gen_per_account",
 };
+
+// Per-generation cost (PixVerse V6 image-to-video at the listed quality).
+const PV_GENERATION_COST = 60;
 
 async function getState() {
   return await chrome.storage.local.get(Object.values(STATE_KEYS));
@@ -673,9 +681,347 @@ async function prepareNextRun() {
 }
 
 // -----------------------------------------------------------------------------
+// Account history helpers
+// -----------------------------------------------------------------------------
+async function getAccountsHistory() {
+  const s = await chrome.storage.local.get("pv_accounts_history");
+  return Array.isArray(s.pv_accounts_history) ? s.pv_accounts_history : [];
+}
+
+async function updateAccountInHistory(email, patch) {
+  const list = await getAccountsHistory();
+  const idx = list.findIndex((a) => (a.email || "").toLowerCase() === (email || "").toLowerCase());
+  if (idx < 0) return false;
+  list[idx] = { ...list[idx], ...patch, lastChecked: new Date().toISOString() };
+  await chrome.storage.local.set({ pv_accounts_history: list });
+  return true;
+}
+
+// Pick an account from history that has at least `minCredits` credits. If the
+// credit count is unknown (older entry without credits field), we treat it as
+// "probably enough" only if we have never tracked it - it'll get re-checked
+// on login. Returns null if nothing fits.
+async function pickAccountWithCredits(minCredits) {
+  const list = await getAccountsHistory();
+  // Prefer accounts with KNOWN credits >= min.
+  const known = list.filter((a) => typeof a.credits === "number");
+  const ok = known.filter((a) => a.credits >= minCredits);
+  if (ok.length) {
+    // Most recent matching first.
+    ok.sort((a, b) => (b.lastChecked || b.createdAt || "").localeCompare(a.lastChecked || a.createdAt || ""));
+    return ok[0];
+  }
+  // Fall back: never-checked entries (treat optimistically). Newest first.
+  const unchecked = list.filter((a) => typeof a.credits !== "number");
+  unchecked.sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || ""));
+  return unchecked[0] || null;
+}
+
+// -----------------------------------------------------------------------------
+// Login + credits read (executeScript, page-side)
+// -----------------------------------------------------------------------------
+
+// Runs in the page. Fills email + password and clicks the submit button on
+// /login. Returns { ok: true } once the click is dispatched, or
+// { ok: false, reason } on failure.
+async function pageWideLoginFill({ email, password }) {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const setReact = (el, value) => {
+    const proto = el.tagName === "TEXTAREA"
+      ? HTMLTextAreaElement.prototype
+      : HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(proto, "value").set;
+    setter.call(el, value);
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+  };
+  const isVisible = (el) => {
+    if (!el || !el.isConnected) return false;
+    const r = el.getBoundingClientRect();
+    if (r.width < 2 || r.height < 2) return false;
+    const cs = getComputedStyle(el);
+    return cs.visibility !== "hidden" && cs.display !== "none" && cs.opacity !== "0";
+  };
+
+  // Wait up to 15s for the login form to render.
+  const start = Date.now();
+  let inputs = [];
+  while (Date.now() - start < 15000) {
+    inputs = Array.from(document.querySelectorAll("input")).filter((i) => {
+      const t = (i.type || "text").toLowerCase();
+      return ["text", "email", "password"].includes(t) && isVisible(i);
+    });
+    if (inputs.length >= 2) break;
+    await sleep(300);
+  }
+  if (inputs.length < 2) return { ok: false, reason: "login form not found (need 2 inputs)" };
+
+  // Heuristic: first text/email input = email, the password input = password.
+  let emailInp = inputs.find((i) => /email|mail/i.test(i.name + " " + i.id + " " + (i.placeholder || "")))
+              || inputs.find((i) => i.type === "email")
+              || inputs.find((i) => i.type !== "password")
+              || inputs[0];
+  let passInp = inputs.find((i) => i.type === "password")
+              || inputs.find((i) => /pass/i.test(i.name + " " + i.id + " " + (i.placeholder || "")))
+              || inputs[1];
+
+  emailInp.focus(); setReact(emailInp, email); emailInp.blur();
+  await sleep(150);
+  passInp.focus(); setReact(passInp, password); passInp.blur();
+  await sleep(400);
+
+  // Find submit button: text Continue/Weiter/Anmelden/Einloggen/Sign in/Log in.
+  const submit = Array.from(document.querySelectorAll("button"))
+    .find((b) =>
+      /^(continue|weiter|anmelden|einloggen|sign\s*in|log\s*in)$/i
+        .test((b.innerText || b.textContent || "").trim()) && isVisible(b)
+    );
+  if (!submit) return { ok: false, reason: "no login submit button found" };
+  if (submit.disabled) return { ok: false, reason: "submit button disabled (turnstile not solved?)" };
+  submit.click();
+  return { ok: true };
+}
+
+// Runs in the page. Tries to find the user-credits number near the top-right
+// avatar/badge. PixVerse renders something like "190" next to a lightning
+// icon. We pick the smallest visible numeric token in the top 80px that
+// looks like 1-5 digits.
+function pageReadCredits() {
+  function isVisible(el) {
+    if (!el || !el.isConnected) return false;
+    const r = el.getBoundingClientRect();
+    if (r.width < 2 || r.height < 2) return false;
+    const cs = getComputedStyle(el);
+    return cs.visibility !== "hidden" && cs.display !== "none" && cs.opacity !== "0";
+  }
+  const cands = [];
+  const all = document.querySelectorAll("span, div, p, a, button, b, strong");
+  for (const el of all) {
+    if (!isVisible(el)) continue;
+    const r = el.getBoundingClientRect();
+    if (r.top > 80) continue;        // top navbar only
+    if (r.right < window.innerWidth * 0.4) continue; // right half-ish
+    const txt = (el.innerText || el.textContent || "").trim();
+    if (!/^\d{1,5}$/.test(txt)) continue;
+    const n = parseInt(txt, 10);
+    if (n < 0 || n > 99999) continue;
+    cands.push({ el, n, r });
+  }
+  if (!cands.length) return { ok: false, reason: "no credit-like number in navbar" };
+  // Prefer the smallest top-coordinate, then leftmost (the one nearest the
+  // lightning icon). Most layouts put credits as a single number.
+  cands.sort((a, b) => a.r.top - b.r.top || a.r.left - b.r.left);
+  return { ok: true, credits: cands[0].n };
+}
+
+// Navigates the active pixverse tab to /login, fills the form, submits, and
+// then reads the credits once the dashboard loads. Updates pv_accounts_history.
+async function loginToAccount(account) {
+  log(`Logging in as ${account.email}`);
+  const tabs = await chrome.tabs.query({ url: "https://app.pixverse.ai/*" });
+  let tab = tabs[0];
+  if (!tab) {
+    tab = await chrome.tabs.create({ url: "https://app.pixverse.ai/login", active: true });
+  } else {
+    await chrome.tabs.update(tab.id, { url: "https://app.pixverse.ai/login", active: true });
+  }
+  await waitForTabComplete(tab.id, 10000);
+  await new Promise((r) => setTimeout(r, 1500));
+
+  let res;
+  try {
+    const out = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      args: [{ email: account.email, password: account.password }],
+      func: pageWideLoginFill,
+    });
+    res = (out && out[0] && out[0].result) || { ok: false };
+  } catch (e) {
+    log(`login executeScript failed: ${e.message}`);
+    return { ok: false, error: e.message };
+  }
+  if (!res.ok) {
+    log(`login fill failed: ${res.reason || "unknown"}`);
+    return { ok: false, error: res.reason };
+  }
+  log(`login form submitted, waiting for dashboard...`);
+
+  // Wait for navigation away from /login.
+  const start = Date.now();
+  while (Date.now() - start < 25000) {
+    await new Promise((r) => setTimeout(r, 500));
+    const t = await chrome.tabs.get(tab.id).catch(() => null);
+    if (t && t.url && !/\/login/.test(t.url)) break;
+  }
+  await waitForTabComplete(tab.id, 8000);
+  await new Promise((r) => setTimeout(r, 1500));
+
+  // Read credits.
+  let credits = null;
+  try {
+    const out = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: pageReadCredits,
+    });
+    const r = (out && out[0] && out[0].result) || {};
+    if (r.ok) credits = r.credits;
+    else log(`credits read: ${r.reason || "unknown"}`);
+  } catch (e) {
+    log(`credits read failed: ${e.message}`);
+  }
+
+  if (credits != null) {
+    log(`Login OK, credits=${credits}`);
+    await updateAccountInHistory(account.email, { credits });
+  } else {
+    log(`Login OK, credits unknown`);
+  }
+  return { ok: true, tab, credits };
+}
+
+// -----------------------------------------------------------------------------
+// Generations queue runner
+// -----------------------------------------------------------------------------
+async function startGenerationsBatch(opts) {
+  const items = Array.isArray(opts.items) ? opts.items : [];
+  if (!items.length) {
+    log("Generations: empty queue");
+    return { ok: false, error: "no items" };
+  }
+  const perAccount = Math.max(1, parseInt(opts.perAccount, 10) || 3);
+  await chrome.storage.local.set({
+    [STATE_KEYS.GEN_ACTIVE]: true,
+    [STATE_KEYS.GEN_QUEUE]: items,
+    [STATE_KEYS.GEN_DONE]: 0,
+    [STATE_KEYS.GEN_TOTAL]: items.length,
+    [STATE_KEYS.GEN_PER_ACCOUNT]: perAccount,
+    [STATE_KEYS.LAST_LOG]: [],
+  });
+  log(`Generations queued: ${items.length} items, ${perAccount} per account`);
+  // Kick off the first step.
+  await chrome.alarms.clear("pv-generations-step");
+  await chrome.alarms.create("pv-generations-step", { when: Date.now() + 100 });
+  return { ok: true, total: items.length };
+}
+
+async function stopGenerations() {
+  await chrome.alarms.clear("pv-generations-step");
+  await chrome.storage.local.set({ [STATE_KEYS.GEN_ACTIVE]: false });
+  await setStatus("idle");
+  log("Generations stopped");
+}
+
+// One step of the generation loop. Picks/logs in to an account, ensures it has
+// >= 180 credits (or whatever perAccount * cost requires), runs up to N
+// generations, logs out, schedules next step. The actual generation trigger
+// is a stub for now (Phase 2). For Phase 1 we just verify login + credits +
+// per-account loop control.
+async function generationsStep() {
+  const s = await getState();
+  if (!s[STATE_KEYS.GEN_ACTIVE]) {
+    log("alarm pv-generations-step: gen not active, ignoring");
+    return;
+  }
+  const queue = Array.isArray(s[STATE_KEYS.GEN_QUEUE]) ? s[STATE_KEYS.GEN_QUEUE] : [];
+  const perAccount = s[STATE_KEYS.GEN_PER_ACCOUNT] || 3;
+  if (!queue.length) {
+    log("Generations: queue empty, all done");
+    await stopGenerations();
+    return;
+  }
+  await setStatus("picking-account");
+
+  const need = perAccount * PV_GENERATION_COST;
+  let acc = await pickAccountWithCredits(need);
+
+  if (!acc) {
+    log(`No history account has >= ${need} credits. Creating new one...`);
+    // Create a brand-new account via the existing register flow. After the
+    // referral claim completes, control comes back here automatically because
+    // PV_REWARD_COMPLETED schedules pv-next-iteration; but here we want the
+    // generations loop to resume. So we run a 1-iteration register/claim
+    // synchronously, then re-query.
+    await setStatus("creating-mailbox");
+    const r = await startRun({ repeatTotal: 1 });
+    if (!r.ok) {
+      log(`Could not create new account: ${r.error}`);
+      await stopGenerations();
+      return;
+    }
+    // The register flow runs asynchronously (mail polling, form filling, ...).
+    // We resume the generations step in 90s to give it time to complete.
+    log("Register flow started; resuming generations in 90s");
+    await chrome.alarms.create("pv-generations-step", { when: Date.now() + 90 * 1000 });
+    return;
+  }
+
+  log(`Selected account ${acc.email} (credits=${acc.credits ?? "?"})`);
+
+  // Logout first (in case some previous session lingers).
+  await setStatus("logging-out");
+  await forceLogoutAndOpenRegister();
+
+  // Login.
+  await setStatus("logging-in");
+  const loginRes = await loginToAccount(acc);
+  if (!loginRes.ok) {
+    log(`Login failed for ${acc.email}, removing-from-pool and retrying`);
+    // Mark this account as 0 credits to skip it next time.
+    await updateAccountInHistory(acc.email, { credits: 0, loginFailed: true });
+    await chrome.alarms.create("pv-generations-step", { when: Date.now() + 5000 });
+    return;
+  }
+  let credits = loginRes.credits ?? acc.credits ?? need;
+  if (typeof credits === "number" && credits < PV_GENERATION_COST) {
+    log(`Account ${acc.email} only has ${credits} credits, switching`);
+    await updateAccountInHistory(acc.email, { credits });
+    await chrome.alarms.create("pv-generations-step", { when: Date.now() + 2000 });
+    return;
+  }
+
+  // Phase 1 stub: do not actually trigger generation yet. Just consume the
+  // queue items at "perAccount" rate, log each, decrement budget, and
+  // continue. Phase 2 will replace this loop body with a real
+  // image-upload + prompt-fill + Erstellen-click sequence.
+  let did = 0;
+  while (did < perAccount && queue.length > 0 && (typeof credits !== "number" || credits >= PV_GENERATION_COST)) {
+    const item = queue[0];
+    log(`[gen-stub] would generate prompt #${(s[STATE_KEYS.GEN_DONE] || 0) + did + 1} on ${acc.email}`);
+    log(`[gen-stub]   prompt[0..80]: ${(item.prompt || "").slice(0, 80).replace(/\n/g, " ")}`);
+    log(`[gen-stub]   image: ${item.imageName || "<unnamed>"} (${(item.imageDataUri || "").length} bytes)`);
+    queue.shift();
+    did++;
+    if (typeof credits === "number") credits -= PV_GENERATION_COST;
+    await chrome.storage.local.set({
+      [STATE_KEYS.GEN_QUEUE]: queue,
+      [STATE_KEYS.GEN_DONE]: (s[STATE_KEYS.GEN_DONE] || 0) + did,
+    });
+  }
+
+  await updateAccountInHistory(acc.email, { credits });
+
+  // Logout and schedule next batch.
+  await setStatus("logging-out");
+  await tryUiLogout();
+  if (queue.length === 0) {
+    log("Generations: queue empty, done");
+    await stopGenerations();
+    return;
+  }
+  log(`Generations: ${did} done on this account, ${queue.length} remaining. Next batch in 30s`);
+  await chrome.alarms.create("pv-generations-step", { when: Date.now() + 30 * 1000 });
+}
+
+// -----------------------------------------------------------------------------
 // Inbox polling driven by chrome.alarms
 // -----------------------------------------------------------------------------
 chrome.alarms.onAlarm.addListener(async (alarm) => {
+  // Generations queue tick.
+  if (alarm.name === "pv-generations-step") {
+    try { await generationsStep(); }
+    catch (e) { log(`generationsStep error: ${e.message}`); }
+    return;
+  }
   // Wakes up to start the next iteration after the cool-down between runs.
   // We use chrome.alarms here instead of setTimeout because the service
   // worker is allowed to go idle after ~30s of inactivity, and setTimeout
@@ -779,6 +1125,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         case "PV_FORCE_POLL_NOW": {
           // For debugging from popup
           chrome.alarms.create("pv-inbox-poll", { when: Date.now() + 100 });
+          sendResponse({ ok: true });
+          return;
+        }
+        case "PV_START_GENERATIONS": {
+          const r = await startGenerationsBatch(msg.opts || {});
+          sendResponse(r);
+          return;
+        }
+        case "PV_STOP_GENERATIONS": {
+          await stopGenerations();
           sendResponse({ ok: true });
           return;
         }

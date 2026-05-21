@@ -12,7 +12,8 @@
     "scripting",
     "notifications",
     "alarms",
-    "cookies"
+    "cookies",
+    "downloads"
   ],
 
   "host_permissions": [
