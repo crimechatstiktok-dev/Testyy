@@ -919,25 +919,31 @@ async function loginToAccount(account) {
 //   2) Locate the prompt textarea by placeholder regex /beschreib/i (matches
 //      the German placeholder "Beschreiben Sie den Inhalt, ..."). Fallback:
 //      first visible textarea.
-//   3) Locate a file input that accepts images (input[type=file] with no
-//      `accept` or `accept` containing "image"/"*"). Inject the supplied
-//      data-URI as a real File via DataTransfer + change event - we never
-//      click the open-dialog button.
-//   4) Wait ~2.5s for the upload preview to render.
-//   5) Fill the prompt via the React-friendly setter (native value setter
+//   3) Locate the active file input (input[type=file] accepting images)
+//      whose .ant-upload-btn ancestor has non-zero size - PixVerse
+//      renders a second "+" slot at 0x0 that we must skip.
+//   4) Inject the supplied data-URI as a real File. We do NOT use the
+//      classic dt.files + value-tracker + change-event hack: rc-upload
+//      (Ant Design's wrapper) listens to the React-synthetic onChange,
+//      not the bubbled DOM change. Instead we call rc-upload's handler
+//      directly: input.__reactProps.onChange first, then onFileDrop on
+//      the .ant-upload-btn span, then beforeUpload+customRequest on
+//      the rc-upload component as a final fallback.
+//   5) Wait ~3.5s for the upload preview to render.
+//   6) Fill the prompt via the React-friendly setter (native value setter
 //      + bubbling input/change events).
-//   6) Settings:
+//   7) Settings:
 //        Audio toggle  -> ON   (Ant Design role=switch, aria-checked=true)
 //        Multi-Aufnahme/Multi-shot toggle -> OFF
 //        Modell dropdown -> "PixVerse V6"
 //        Anzahl number stepper -> 1 (best-effort, usually already 1)
 //      All located via DOM-distance to the matching label, never by class.
-//   7) Click the "Erstellen" trigger. On PixVerse this is a clickable
+//   8) Click the "Erstellen" trigger. On PixVerse this is a clickable
 //      <div> (NOT a <button>), so we find the deepest element whose
 //      own text is "Erstellen" and walk up to the nearest clickable
 //      ancestor. Full pointer/mouse event sequence (matches the existing
 //      claimReferralReward pattern).
-//   8) Soft-confirm: sleep 5.5s and check whether the create trigger went
+//   9) Soft-confirm: sleep 5.5s and check whether the create trigger went
 //      disabled / its text changed / a generating-spinner appeared. We do
 //      NOT wait for the video to finish - that takes minutes. 5-10s is
 //      enough to know the request was accepted.
@@ -1177,59 +1183,179 @@ async function pageWideRunGeneration({ prompt, imageName, imageDataUri }) {
 
   // ---------------------------------------------------------------------------
   // 3) File input.
+  //    PixVerse renders TWO `input[type=file]` elements (probed live):
+  //      - one inside an .ant-upload-btn whose bounding rect is 0x0 (the
+  //        secondary "add another" slot, currently inactive)
+  //      - one inside an .ant-upload-btn at e.g. 72x72 (the visible upload
+  //        thumbnail tile - this is the active slot)
+  //    We must pick the active one. Both have accept="image/png,image/jpeg,
+  //    image/webp", so the legacy "first match wins" logic could grab the
+  //    wrong slot. We score by the .ant-upload-btn ancestor's rect size.
   // ---------------------------------------------------------------------------
   const fileInput = await waitFor(() => {
-    const inputs = Array.from(document.querySelectorAll("input[type='file']"));
-    if (!inputs.length) return null;
-    // Prefer one whose accept attribute mentions image (or is empty/star).
-    for (const i of inputs) {
+    const all = Array.from(document.querySelectorAll("input[type='file']"));
+    const imageInputs = all.filter((i) => {
       const acc = (i.getAttribute("accept") || "").toLowerCase();
-      if (!acc || acc.includes("image") || acc.includes("*")) return i;
+      return !acc || acc.includes("image") || acc.includes("*");
+    });
+    if (!imageInputs.length) return null;
+    // Prefer the one whose .ant-upload-btn ancestor has non-zero size.
+    let best = null, bestArea = -1;
+    for (const inp of imageInputs) {
+      const btn = inp.closest(".ant-upload-btn") || inp.parentElement;
+      const r = btn ? btn.getBoundingClientRect() : { width: 0, height: 0 };
+      const area = r.width * r.height;
+      if (area > bestArea) { bestArea = area; best = inp; }
     }
-    return inputs[0];
+    return best || imageInputs[0];
   }, 15000, 300);
   if (!fileInput) return { ok: false, reason: "file input not found" };
 
   // ---------------------------------------------------------------------------
-  // 4) Inject the file via DataTransfer.
-  //    React (and rc-upload that PixVerse uses under the hood) wraps the
-  //    native input in a synthetic event system AND keeps an internal
-  //    `_valueTracker` on the input so onChange only fires when the
-  //    tracked value actually differs. A naive `input.files = dt.files`
-  //    bypasses both, so React doesn't pick up the change. The robust
-  //    pattern is:
-  //      a) call the native HTMLInputElement.prototype "files" setter
-  //         (avoids any React property override on the element)
-  //      b) reset the value tracker so React sees a new value
-  //      c) fire `input` and `change` with bubbles+composed
+  // 4) Inject the file into rc-upload.
+  //
+  //    PixVerse uses Ant Design's <Upload.Dragger> which is backed by
+  //    rc-upload. A live React-fiber probe of the input element revealed:
+  //
+  //      input.__reactProps$xxx.onChange     <- rc-upload's input handler
+  //                                             (calls uploadFiles(files))
+  //      span.ant-upload-btn .__reactProps$xxx.onDrop  -> onFileDrop
+  //      <RcUpload component> memoizedProps  -> beforeUpload, customRequest,
+  //                                             onSuccess, onError, ...
+  //
+  //    The classic `dt.files` + `_valueTracker` + change-event approach
+  //    fails because rc-upload listens for the *React-synthetic* onChange
+  //    bound directly on the input prop, not the DOM-level change event.
+  //    The synthetic handler is fired by React's event system from the
+  //    delegated root listener; a bubbled "change" Event fired manually
+  //    on a `display:none` input does not retrigger it reliably.
+  //
+  //    Three-tier strategy, in order of cleanliness:
+  //      Plan A: call input.__reactProps.onChange({ target:{files} })
+  //              directly. This is exactly what rc-upload's bound handler
+  //              expects and routes through beforeUpload+customRequest.
+  //      Plan B: call .ant-upload-btn span's onDrop({ dataTransfer })
+  //              (== rc-upload's onFileDrop, also routes through uploadFiles)
+  //      Plan C: walk fiber.return up to find the rc-upload component's
+  //              memoizedProps with beforeUpload+customRequest, run the
+  //              pipeline manually.
   // ---------------------------------------------------------------------------
   let file;
   try { file = dataUriToFile(imageDataUri, imageName); }
   catch (e) { return { ok: false, reason: "data URI decode failed: " + e.message }; }
 
-  try {
-    const dt = new DataTransfer();
-    dt.items.add(file);
+  const propsKeyOf = (el) =>
+    el && Object.keys(el).find((k) => k.startsWith("__reactProps"));
+  const fiberKeyOf = (el) =>
+    el && Object.keys(el).find((k) => k.startsWith("__reactFiber"));
 
+  const dt = new DataTransfer();
+  dt.items.add(file);
+
+  // Set the native files property on the input first - some rc-upload
+  // versions read input.files inside their handler, even when invoked
+  // synthetically.
+  try {
     const filesDesc = Object.getOwnPropertyDescriptor(
       HTMLInputElement.prototype, "files"
     );
-    if (filesDesc && filesDesc.set) {
-      filesDesc.set.call(fileInput, dt.files);
-    } else {
-      fileInput.files = dt.files;
-    }
-
-    // React 16/17/18 keep a tracker on inputs they manage. Resetting
-    // it forces React's onChange to fire.
-    if (fileInput._valueTracker && typeof fileInput._valueTracker.setValue === "function") {
+    if (filesDesc && filesDesc.set) filesDesc.set.call(fileInput, dt.files);
+    else fileInput.files = dt.files;
+    if (fileInput._valueTracker
+        && typeof fileInput._valueTracker.setValue === "function") {
       try { fileInput._valueTracker.setValue(""); } catch (_) {}
     }
+  } catch (_) {}
 
-    fileInput.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
-    fileInput.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
-  } catch (e) {
-    return { ok: false, reason: "file injection failed: " + e.message };
+  let injected = null;
+  let lastErr = null;
+
+  // ---- Plan A: input.__reactProps.onChange -----------------------------------
+  if (!injected) {
+    try {
+      const pk = propsKeyOf(fileInput);
+      const props = pk && fileInput[pk];
+      if (props && typeof props.onChange === "function") {
+        const synth = {
+          target: fileInput,
+          currentTarget: fileInput,
+          type: "change",
+          preventDefault() {},
+          stopPropagation() {},
+          persist() {},
+          nativeEvent: new Event("change", { bubbles: true }),
+        };
+        props.onChange(synth);
+        injected = "A";
+      }
+    } catch (e) { lastErr = e; }
+  }
+
+  // ---- Plan B: ant-upload-btn span.onDrop (== rc-upload's onFileDrop) -------
+  if (!injected) {
+    try {
+      const span = fileInput.closest(".ant-upload-btn");
+      const pk = span && propsKeyOf(span);
+      const sProps = pk && span[pk];
+      if (sProps && typeof sProps.onDrop === "function") {
+        const dropEvt = {
+          type: "drop",
+          target: span,
+          currentTarget: span,
+          dataTransfer: dt,
+          preventDefault() {},
+          stopPropagation() {},
+          persist() {},
+          nativeEvent: new Event("drop", { bubbles: true }),
+        };
+        sProps.onDrop(dropEvt);
+        injected = "B";
+      }
+    } catch (e) { lastErr = e; }
+  }
+
+  // ---- Plan C: manual rc-upload pipeline (beforeUpload -> customRequest) ----
+  if (!injected) {
+    try {
+      let f = fileInput[fiberKeyOf(fileInput)];
+      let pipeline = null;
+      for (let i = 0; f && i < 25; i++, f = f.return) {
+        const p = f.memoizedProps;
+        if (p && typeof p.beforeUpload === "function"
+              && typeof p.customRequest === "function") {
+          pipeline = p; break;
+        }
+      }
+      if (!pipeline) throw new Error("no rc-upload pipeline props found");
+
+      const ok = await Promise.resolve(pipeline.beforeUpload(file, [file]));
+      if (ok === false) throw new Error("beforeUpload rejected");
+      const realFile = (ok && ok instanceof Blob) ? ok : file;
+
+      await new Promise((resolve, reject) => {
+        try {
+          pipeline.customRequest({
+            file: realFile,
+            filename: realFile.name || imageName,
+            action: pipeline.action,
+            headers: pipeline.headers || {},
+            withCredentials: !!pipeline.withCredentials,
+            data: pipeline.data,
+            onProgress: () => {},
+            onSuccess: (body, xhr) => resolve({ body, xhr }),
+            onError: (err) => reject(err),
+          });
+        } catch (e) { reject(e); }
+      });
+      injected = "C";
+    } catch (e) { lastErr = e; }
+  }
+
+  if (!injected) {
+    return {
+      ok: false,
+      reason: "file injection failed: " + (lastErr && lastErr.message || "all plans failed"),
+    };
   }
 
   // 5) Give the upload preview time to render. Image-to-video uploads
@@ -1466,6 +1592,11 @@ async function runGenerationInTab(tab, item) {
     try {
       const out = await chrome.scripting.executeScript({
         target: { tabId: tab.id },
+        // MAIN world: rc-upload's onChange / onFileDrop callbacks live on
+        // the page-realm React fibers. Calling them from the isolated
+        // content-script world works for simple inputs but can break on
+        // realm-sensitive checks inside React's synthetic event system.
+        world: "MAIN",
         args: [{
           prompt: item.prompt,
           imageName: item.imageName,
