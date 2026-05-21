@@ -1192,6 +1192,16 @@ async function pageWideRunGeneration({ prompt, imageName, imageDataUri }) {
 
   // ---------------------------------------------------------------------------
   // 4) Inject the file via DataTransfer.
+  //    React (and rc-upload that PixVerse uses under the hood) wraps the
+  //    native input in a synthetic event system AND keeps an internal
+  //    `_valueTracker` on the input so onChange only fires when the
+  //    tracked value actually differs. A naive `input.files = dt.files`
+  //    bypasses both, so React doesn't pick up the change. The robust
+  //    pattern is:
+  //      a) call the native HTMLInputElement.prototype "files" setter
+  //         (avoids any React property override on the element)
+  //      b) reset the value tracker so React sees a new value
+  //      c) fire `input` and `change` with bubbles+composed
   // ---------------------------------------------------------------------------
   let file;
   try { file = dataUriToFile(imageDataUri, imageName); }
@@ -1200,16 +1210,31 @@ async function pageWideRunGeneration({ prompt, imageName, imageDataUri }) {
   try {
     const dt = new DataTransfer();
     dt.items.add(file);
-    fileInput.files = dt.files;
-    // React's onChange listens on the bubbling change event.
-    fileInput.dispatchEvent(new Event("input", { bubbles: true }));
-    fileInput.dispatchEvent(new Event("change", { bubbles: true }));
+
+    const filesDesc = Object.getOwnPropertyDescriptor(
+      HTMLInputElement.prototype, "files"
+    );
+    if (filesDesc && filesDesc.set) {
+      filesDesc.set.call(fileInput, dt.files);
+    } else {
+      fileInput.files = dt.files;
+    }
+
+    // React 16/17/18 keep a tracker on inputs they manage. Resetting
+    // it forces React's onChange to fire.
+    if (fileInput._valueTracker && typeof fileInput._valueTracker.setValue === "function") {
+      try { fileInput._valueTracker.setValue(""); } catch (_) {}
+    }
+
+    fileInput.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+    fileInput.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
   } catch (e) {
     return { ok: false, reason: "file injection failed: " + e.message };
   }
 
-  // 5) Give the upload preview time to render.
-  await sleep(2500);
+  // 5) Give the upload preview time to render. Image-to-video uploads
+  //    typically need 2-4 seconds to upload + thumbnail.
+  await sleep(3500);
 
   // ---------------------------------------------------------------------------
   // 6) Fill prompt.
@@ -1225,6 +1250,70 @@ async function pageWideRunGeneration({ prompt, imageName, imageDataUri }) {
   const audioRes = await setToggle(/^\s*audio\s*$/i, true);
   const multiRes = await setToggle(
     /^\s*multi[- ]?aufnahme\s*$|multi[- ]?shot|multi[- ]?take/i, false
+  );
+
+  // Helper for the quality + duration controls. PixVerse renders the
+  // current value as a clickable text label in the bottom toolbar
+  // ("540P", "5s", etc). Clicking it opens a small popover with all
+  // available options as separate clickable elements. We click the
+  // current label, wait for the popover, then click the option matching
+  // optionRe. If the popover never opens or the option is missing we
+  // press Escape and report failure (non-fatal: defaults still produce
+  // a valid generation).
+  const setLabeledChoice = async (currentRe, optionRe, what) => {
+    const cur = findDeepestLabel(currentRe);
+    if (!cur) return { ok: false, reason: `${what}: current label not found` };
+    const curText = (cur.innerText || "").trim();
+    if (optionRe.test(curText)) {
+      return { ok: true, alreadyOk: true, was: curText };
+    }
+    // Walk up to a clickable ancestor (the text node sits inside a
+    // styled <div> wrapper that is the actual click target).
+    let target = cur;
+    for (let i = 0; i < 5 && target; i++) {
+      const role = target.getAttribute && target.getAttribute("role");
+      if (target.tagName === "BUTTON" || role === "button" ||
+          target.hasAttribute("data-base-ui-click-trigger") ||
+          (typeof target.tabIndex === "number" && target.tabIndex >= 0)) {
+        break;
+      }
+      target = target.parentElement;
+    }
+    clickFull(target || cur);
+    await sleep(700);
+
+    // The popover renders into a portal at document.body level, so
+    // findClickableByText (which scans the whole document) finds it.
+    const opt = findClickableByText(optionRe) || findDeepestLabel(optionRe);
+    if (!opt) {
+      document.body.dispatchEvent(new KeyboardEvent("keydown",
+        { key: "Escape", code: "Escape", bubbles: true }));
+      await sleep(200);
+      return { ok: false, reason: `${what}: option not found in popover`, was: curText };
+    }
+    clickFull(opt);
+    await sleep(450);
+    // Defensive: close any leftover popover (Ant/Base UI usually
+    // self-closes on selection, but Escape is harmless if it's gone).
+    document.body.dispatchEvent(new KeyboardEvent("keydown",
+      { key: "Escape", code: "Escape", bubbles: true }));
+    await sleep(200);
+    return { ok: true, switched: true, was: curText };
+  };
+
+  // Quality -> 720P. Default is often 540P which costs the same on
+  // image-to-video but produces a noticeably worse render.
+  const qualityRes = await setLabeledChoice(
+    /^(360P|540P|720P|1080P|4K)$/i,
+    /^720P$/i,
+    "quality"
+  );
+
+  // Duration -> 6s. Default is 5s.
+  const durationRes = await setLabeledChoice(
+    /^([3-9]|1[0-9])\s*s$/i,
+    /^6\s*s$/i,
+    "duration"
   );
 
   // Modell dropdown.
@@ -1329,6 +1418,7 @@ async function pageWideRunGeneration({ prompt, imageName, imageDataUri }) {
     return {
       ok: false, reason: "Erstellen text/button not found in time",
       audio: audioRes, multi: multiRes, model: modelRes,
+      quality: qualityRes, duration: durationRes,
     };
   }
 
@@ -1362,6 +1452,8 @@ async function pageWideRunGeneration({ prompt, imageName, imageDataUri }) {
     audio: audioRes,
     multi: multiRes,
     model: modelRes,
+    quality: qualityRes,
+    duration: durationRes,
   };
 }
 
@@ -1614,6 +1706,14 @@ async function generationsStep() {
 
     log(`[gen] OK #${idx} confirmed=${res.confirmed ? "yes" : "soft"} `
       + `credits=${credits} queue=${queue.length}`);
+    // Surface which settings actually got applied so the user can tell
+    // from the popup log whether the 720P / 6s pickers were found.
+    const fmt = (r) => r ? (r.alreadyOk ? `${r.was || "?"}(ok)`
+                                        : r.switched ? `->${r.was || "?"}`
+                                        : r.ok ? "ok" : `FAIL:${r.reason || "?"}`)
+                         : "?";
+    log(`[gen]   settings: quality=${fmt(res.quality)} duration=${fmt(res.duration)} `
+      + `audio=${fmt(res.audio)} multi=${fmt(res.multi)} model=${fmt(res.model)}`);
 
     // Small pause between generations on the same account to let the UI
     // settle (the gallery card animation, the credits-deduction tick, ...).
