@@ -879,6 +879,479 @@ async function loginToAccount(account) {
   return { ok: true, tab, credits };
 }
 
+// =============================================================================
+// Phase 2 - Page-side generation flow
+// =============================================================================
+//
+// The actual UI automation that triggers ONE PixVerse video generation. Runs
+// inside the page via chrome.scripting.executeScript (NOT via content-script
+// messaging - we want a single deterministic round-trip per item, no
+// race-conditions with SPA navigation).
+//
+// Steps (top of the function, in order):
+//   1) If a "Bild" / "Image" tab exists, click it (the form is tab-gated on
+//      some PixVerse builds). No-op if already selected.
+//   2) Locate the prompt textarea by placeholder regex /beschreib/i (matches
+//      the German placeholder "Beschreiben Sie den Inhalt, ..."). Fallback:
+//      first visible textarea.
+//   3) Locate a file input that accepts images (input[type=file] with no
+//      `accept` or `accept` containing "image"/"*"). Inject the supplied
+//      data-URI as a real File via DataTransfer + change event - we never
+//      click the open-dialog button.
+//   4) Wait ~2.5s for the upload preview to render.
+//   5) Fill the prompt via the React-friendly setter (native value setter
+//      + bubbling input/change events).
+//   6) Settings:
+//        Audio toggle  -> ON
+//        Multi-Aufnahme/Multi-shot toggle -> OFF
+//        Modell dropdown -> "PixVerse V6"
+//        Anzahl number stepper -> 1
+//      All located via DOM-distance to the matching label, never by class.
+//   7) Click "Erstellen"/"Create"/"Generate" with the full pointer/mouse
+//      sequence (same pattern claimReferralReward uses for the referral
+//      submit button).
+//   8) Soft-confirm: sleep 5.5s and check whether the create button became
+//      disabled / its text changed / a generating-spinner appeared. We do
+//      NOT wait for the video to finish - that takes minutes. 5-10s is
+//      enough to know the request was accepted.
+//
+// Returns { ok, reason?, startedAt?, confirmed?, audio?, multi?, model? }.
+async function pageWideRunGeneration({ prompt, imageName, imageDataUri }) {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  const isVisible = (el) => {
+    if (!el || !el.isConnected) return false;
+    const r = el.getBoundingClientRect();
+    if (r.width < 2 || r.height < 2) return false;
+    const cs = getComputedStyle(el);
+    return cs.visibility !== "hidden" && cs.display !== "none" && cs.opacity !== "0";
+  };
+
+  const setReact = (el, value) => {
+    const proto = el.tagName === "TEXTAREA"
+      ? HTMLTextAreaElement.prototype
+      : HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(proto, "value").set;
+    setter.call(el, value);
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+  };
+
+  const clickFull = (el) => {
+    if (!el) return false;
+    try { el.scrollIntoView({ block: "center", inline: "center" }); } catch (_) {}
+    const r = el.getBoundingClientRect();
+    const cx = r.left + r.width / 2;
+    const cy = r.top + r.height / 2;
+    const opts = {
+      bubbles: true, cancelable: true, composed: true, view: window,
+      clientX: cx, clientY: cy, button: 0, buttons: 1,
+      pointerType: "mouse", isPrimary: true,
+    };
+    try {
+      el.dispatchEvent(new PointerEvent("pointerover", opts));
+      el.dispatchEvent(new MouseEvent("mouseover", opts));
+      el.dispatchEvent(new PointerEvent("pointerenter", opts));
+      el.dispatchEvent(new MouseEvent("mouseenter", opts));
+      el.dispatchEvent(new PointerEvent("pointerdown", opts));
+      el.dispatchEvent(new MouseEvent("mousedown", opts));
+      el.dispatchEvent(new PointerEvent("pointerup", opts));
+      el.dispatchEvent(new MouseEvent("mouseup", opts));
+      el.dispatchEvent(new MouseEvent("click", opts));
+    } catch (_) {}
+    try { el.click && el.click(); } catch (_) {}
+    return true;
+  };
+
+  // Find the smallest (deepest) visible element whose own text matches.
+  const findDeepestLabel = (re) => {
+    const cands = document.querySelectorAll(
+      "h1,h2,h3,h4,h5,h6,div,span,label,p,a,strong,em,b"
+    );
+    let best = null, bestLen = Infinity;
+    for (const el of cands) {
+      if (!isVisible(el)) continue;
+      const txt = (el.innerText || el.textContent || "").trim();
+      if (!txt || txt.length > 200) continue;
+      if (!re.test(txt)) continue;
+      if (txt.length < bestLen) { bestLen = txt.length; best = el; }
+    }
+    return best;
+  };
+
+  const findClickableByText = (re) => {
+    const list = document.querySelectorAll(
+      "button, a, [role='button'], [role='tab'], [role='option'], [role='menuitem']"
+    );
+    for (const el of list) {
+      if (!isVisible(el)) continue;
+      const txt = (el.innerText || el.textContent || "").trim();
+      if (re.test(txt)) return el;
+    }
+    return null;
+  };
+
+  // Pick the clickable matching clickRe with smallest DOM-distance to the
+  // deepest label matching labelRe. Mirrors content.js#findClickableNearLabel.
+  const findClickableNearLabel = (labelRe, clickRe, extraSel) => {
+    const label = findDeepestLabel(labelRe);
+    if (!label) return null;
+    const sel = extraSel
+      || "button, a, [role='button'], [role='switch'], [role='tab'], [role='option']";
+    const cands = Array.from(document.querySelectorAll(sel)).filter((b) =>
+      isVisible(b) && clickRe.test((b.innerText || b.textContent || "").trim())
+    );
+    if (!cands.length) return null;
+    const ancestors = new Map();
+    let d = 0;
+    for (let n = label; n; n = n.parentElement) { ancestors.set(n, d++); }
+    let best = null, bestDist = Infinity;
+    for (const btn of cands) {
+      let n = btn, bd = 0;
+      while (n && !ancestors.has(n)) { n = n.parentElement; bd++; }
+      if (!n) continue;
+      const total = bd + ancestors.get(n);
+      if (total < bestDist) { bestDist = total; best = btn; }
+    }
+    return best;
+  };
+
+  // Find a toggle-switch closest in DOM-distance to a label matching labelRe.
+  // Includes role=switch, [data-state=checked|unchecked], and class-name
+  // heuristics ("switch"/"toggle") - empty-text elements are fine here so
+  // we match by selector, not by inner text.
+  const findToggleNearLabel = (labelRe) => {
+    const label = findDeepestLabel(labelRe);
+    if (!label) return null;
+    const cands = Array.from(document.querySelectorAll(
+      "[role='switch'], button[role='switch'], [data-state='checked'], [data-state='unchecked'], [class*='switch' i], [class*='toggle' i]"
+    )).filter(isVisible);
+    if (!cands.length) return null;
+    const ancestors = new Map();
+    let d = 0;
+    for (let n = label; n; n = n.parentElement) { ancestors.set(n, d++); }
+    let best = null, bestDist = Infinity;
+    for (const btn of cands) {
+      let n = btn, bd = 0;
+      while (n && !ancestors.has(n)) { n = n.parentElement; bd++; }
+      if (!n) continue;
+      const total = bd + ancestors.get(n);
+      if (total < bestDist) { bestDist = total; best = btn; }
+    }
+    return best;
+  };
+
+  const toggleState = (el) => {
+    if (!el) return null;
+    const ac = el.getAttribute("aria-checked");
+    if (ac === "true") return true;
+    if (ac === "false") return false;
+    const ap = el.getAttribute("aria-pressed");
+    if (ap === "true") return true;
+    if (ap === "false") return false;
+    const ds = el.dataset && (el.dataset.state || el.dataset.checked);
+    if (ds === "checked" || ds === "on" || ds === "true") return true;
+    if (ds === "unchecked" || ds === "off" || ds === "false") return false;
+    const cls = ((el.className || "") + "").toLowerCase();
+    if (/(^|[\s_-])(checked|active|on|enabled|is-on)([\s_-]|$)/.test(cls)) return true;
+    return false;
+  };
+
+  const setToggle = async (labelRe, want) => {
+    const t = findToggleNearLabel(labelRe);
+    if (!t) return { ok: false, reason: "toggle not found" };
+    const cur = toggleState(t);
+    if (cur === want) return { ok: true, was: cur, clicked: false };
+    clickFull(t);
+    await sleep(350);
+    return { ok: true, was: cur, clicked: true };
+  };
+
+  const dataUriToFile = (uri, name) => {
+    const m = (uri || "").match(/^data:([^;,]+)(?:;base64)?,(.*)$/);
+    if (!m) throw new Error("not a data URI");
+    const mime = m[1] || "image/png";
+    const b64 = m[2];
+    const bin = atob(b64);
+    const arr = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+    let safe = name || "upload";
+    if (!/\.[a-z0-9]{2,5}$/i.test(safe)) {
+      const ext = (mime.split("/")[1] || "png").split("+")[0];
+      safe = safe + "." + ext;
+    }
+    return new File([arr], safe, { type: mime });
+  };
+
+  const waitFor = async (fn, timeoutMs, intervalMs) => {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      try { const v = fn(); if (v) return v; } catch (_) {}
+      await sleep(intervalMs);
+    }
+    return null;
+  };
+
+  // ---------------------------------------------------------------------------
+  // 1) Click "Bild" / "Image" tab if present and not already selected.
+  // ---------------------------------------------------------------------------
+  try {
+    const bildTab = await waitFor(() => {
+      const cands = Array.from(document.querySelectorAll(
+        "[role='tab'], button, a, div, span"
+      )).filter((el) => {
+        if (!isVisible(el)) return false;
+        const t = (el.innerText || "").trim();
+        return /^(bild|image|foto)$/i.test(t) && t.length <= 10;
+      });
+      return cands[0] || null;
+    }, 4000, 250);
+    if (bildTab) {
+      const sel = bildTab.getAttribute("aria-selected");
+      const ds  = bildTab.dataset && (bildTab.dataset.state || "");
+      const cls = ((bildTab.className || "") + "").toLowerCase();
+      const alreadyActive = sel === "true" || ds === "active" ||
+        /\bactive\b|\bselected\b/.test(cls);
+      if (!alreadyActive) {
+        clickFull(bildTab);
+        await sleep(700);
+      }
+    }
+  } catch (_) { /* tab is optional */ }
+
+  // ---------------------------------------------------------------------------
+  // 2) Prompt textarea.
+  // ---------------------------------------------------------------------------
+  const promptEl = await waitFor(() => {
+    const tas = Array.from(document.querySelectorAll("textarea")).filter(isVisible);
+    for (const ta of tas) {
+      const sig = (ta.placeholder || "") + " "
+                + (ta.getAttribute("aria-label") || "") + " "
+                + (ta.name || "");
+      if (/beschreib|describe/i.test(sig)) return ta;
+    }
+    // Fallback: a single visible textarea is almost certainly the prompt.
+    if (tas.length === 1) return tas[0];
+    return null;
+  }, 15000, 300);
+  if (!promptEl) return { ok: false, reason: "prompt textarea not found" };
+
+  // ---------------------------------------------------------------------------
+  // 3) File input.
+  // ---------------------------------------------------------------------------
+  const fileInput = await waitFor(() => {
+    const inputs = Array.from(document.querySelectorAll("input[type='file']"));
+    if (!inputs.length) return null;
+    // Prefer one whose accept attribute mentions image (or is empty/star).
+    for (const i of inputs) {
+      const acc = (i.getAttribute("accept") || "").toLowerCase();
+      if (!acc || acc.includes("image") || acc.includes("*")) return i;
+    }
+    return inputs[0];
+  }, 15000, 300);
+  if (!fileInput) return { ok: false, reason: "file input not found" };
+
+  // ---------------------------------------------------------------------------
+  // 4) Inject the file via DataTransfer.
+  // ---------------------------------------------------------------------------
+  let file;
+  try { file = dataUriToFile(imageDataUri, imageName); }
+  catch (e) { return { ok: false, reason: "data URI decode failed: " + e.message }; }
+
+  try {
+    const dt = new DataTransfer();
+    dt.items.add(file);
+    fileInput.files = dt.files;
+    // React's onChange listens on the bubbling change event.
+    fileInput.dispatchEvent(new Event("input", { bubbles: true }));
+    fileInput.dispatchEvent(new Event("change", { bubbles: true }));
+  } catch (e) {
+    return { ok: false, reason: "file injection failed: " + e.message };
+  }
+
+  // 5) Give the upload preview time to render.
+  await sleep(2500);
+
+  // ---------------------------------------------------------------------------
+  // 6) Fill prompt.
+  // ---------------------------------------------------------------------------
+  promptEl.focus();
+  setReact(promptEl, prompt || "");
+  promptEl.blur();
+  await sleep(400);
+
+  // ---------------------------------------------------------------------------
+  // 7) Settings.
+  // ---------------------------------------------------------------------------
+  const audioRes = await setToggle(/^\s*audio\s*$/i, true);
+  const multiRes = await setToggle(
+    /^\s*multi[- ]?aufnahme\s*$|multi[- ]?shot|multi[- ]?take/i, false
+  );
+
+  // Modell dropdown.
+  let modelRes;
+  try {
+    let trigger = findClickableNearLabel(
+      /^\s*modell\s*$|^\s*model\s*$/i,
+      /pixverse\s*v\s*\d/i,
+      "button, a, [role='button'], [role='combobox'], [aria-haspopup], div, span"
+    );
+    if (!trigger) trigger = findClickableByText(/^pixverse\s*v\s*\d/i);
+    if (trigger) {
+      const cur = (trigger.innerText || "").trim();
+      if (/pixverse\s*v\s*6/i.test(cur)) {
+        modelRes = { ok: true, alreadyV6: true };
+      } else {
+        clickFull(trigger);
+        await sleep(700);
+        const opt = findClickableByText(/^pixverse\s*v\s*6\b/i)
+                 || findClickableByText(/\bpixverse\s*v\s*6\b/i);
+        if (opt) {
+          clickFull(opt);
+          await sleep(400);
+          modelRes = { ok: true, switched: true };
+        } else {
+          // Close any open menu.
+          document.body.dispatchEvent(new KeyboardEvent("keydown",
+            { key: "Escape", code: "Escape", bubbles: true }));
+          await sleep(150);
+          modelRes = { ok: false, reason: "v6 option not found" };
+        }
+      }
+    } else {
+      modelRes = { ok: false, reason: "model trigger not found" };
+    }
+  } catch (e) { modelRes = { ok: false, reason: "model error: " + e.message }; }
+
+  // Anzahl = 1. Best-effort: a number input near a label "Anzahl"/"Quantity".
+  try {
+    const numLabel = findDeepestLabel(/^anzahl|^quantity|number of/i);
+    if (numLabel) {
+      let cur = numLabel;
+      let inp = null;
+      for (let i = 0; i < 5 && cur; i++) {
+        const cands = cur.querySelectorAll(
+          "input[type='number'], input[inputmode='numeric'], input[role='spinbutton']"
+        );
+        for (const c of cands) { if (isVisible(c)) { inp = c; break; } }
+        if (inp) break;
+        cur = cur.parentElement;
+      }
+      if (inp && (inp.value || "").trim() !== "1") {
+        inp.focus();
+        setReact(inp, "1");
+        inp.blur();
+        await sleep(200);
+      }
+    }
+  } catch (_) { /* non-fatal */ }
+
+  // ---------------------------------------------------------------------------
+  // 8) Click "Erstellen". Wait up to 12s for it to be enabled (upload may
+  //    still be processing on the server side).
+  // ---------------------------------------------------------------------------
+  const createRe = /^\s*(erstellen|create|generate|generieren)\s*$/i;
+  const createBtn = await waitFor(() => {
+    const list = Array.from(document.querySelectorAll("button, [role='button']"));
+    for (const b of list) {
+      if (!isVisible(b)) continue;
+      const t = (b.innerText || b.textContent || "").trim();
+      if (!createRe.test(t)) continue;
+      if (b.disabled) continue;
+      if (b.getAttribute("aria-disabled") === "true") continue;
+      const cls = ((b.className || "") + "").toLowerCase();
+      if (cls.includes("cursor-not-allowed")) continue;
+      if (cls.includes("disabled") && !cls.includes("not-disabled")) continue;
+      return b;
+    }
+    return null;
+  }, 12000, 400);
+  if (!createBtn) {
+    return {
+      ok: false, reason: "Erstellen button not enabled in time",
+      audio: audioRes, multi: multiRes, model: modelRes,
+    };
+  }
+
+  clickFull(createBtn);
+  const startedAt = new Date().toISOString();
+
+  // ---------------------------------------------------------------------------
+  // 9) Soft-confirm the click took effect. We don't wait for the video to
+  //    finish - that takes minutes. 5.5s is enough to observe the transition
+  //    to "generating" / disabled / spinner.
+  // ---------------------------------------------------------------------------
+  await sleep(5500);
+  let confirmed = false;
+  try {
+    const stillEnabled = !createBtn.disabled
+      && createBtn.getAttribute("aria-disabled") !== "true";
+    const txt = (createBtn.innerText || "").trim();
+    if (!stillEnabled || /generat|wird erstellt|läuft|warten/i.test(txt)) confirmed = true;
+    if (!confirmed) {
+      const newVid = document.querySelector(
+        "video, [class*='loading' i], [class*='generating' i], [class*='processing' i], [class*='progress' i]"
+      );
+      if (newVid && isVisible(newVid)) confirmed = true;
+    }
+  } catch (_) {}
+
+  return {
+    ok: true,
+    startedAt,
+    confirmed,
+    audio: audioRes,
+    multi: multiRes,
+    model: modelRes,
+  };
+}
+
+// Wrapper that ensures the tab is on a creation page, then injects
+// pageWideRunGeneration. Tries "/" first (home page hosts the form on most
+// PixVerse builds); if the page-side function reports "prompt textarea not
+// found" or "file input not found", retries once on /creation/video.
+async function runGenerationInTab(tab, item) {
+  const inject = async () => {
+    try {
+      const out = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        args: [{
+          prompt: item.prompt,
+          imageName: item.imageName,
+          imageDataUri: item.imageDataUri,
+        }],
+        func: pageWideRunGeneration,
+      });
+      return (out && out[0] && out[0].result) || { ok: false, reason: "no result" };
+    } catch (e) {
+      return { ok: false, reason: "executeScript: " + e.message };
+    }
+  };
+
+  // Are we already on a creation-capable page?
+  let curPath = "";
+  try {
+    const cur = await chrome.tabs.get(tab.id);
+    curPath = new URL(cur.url).pathname;
+  } catch (_) {}
+
+  if (curPath !== "/" && !/^\/creation\/video/.test(curPath)) {
+    await chrome.tabs.update(tab.id, { url: "https://app.pixverse.ai/" });
+    await waitForTabComplete(tab.id, 12000);
+    await new Promise((r) => setTimeout(r, 1800));
+  }
+
+  let res = await inject();
+  if (!res.ok && /textarea not found|file input not found/i.test(res.reason || "")) {
+    log(`Generation: form not on "/" (${res.reason}), retrying on /creation/video`);
+    await chrome.tabs.update(tab.id, { url: "https://app.pixverse.ai/creation/video" });
+    await waitForTabComplete(tab.id, 12000);
+    await new Promise((r) => setTimeout(r, 2000));
+    res = await inject();
+  }
+  return res;
+}
+
 // -----------------------------------------------------------------------------
 // Generations queue runner
 // -----------------------------------------------------------------------------
@@ -979,23 +1452,74 @@ async function generationsStep() {
     return;
   }
 
-  // Phase 1 stub: do not actually trigger generation yet. Just consume the
-  // queue items at "perAccount" rate, log each, decrement budget, and
-  // continue. Phase 2 will replace this loop body with a real
-  // image-upload + prompt-fill + Erstellen-click sequence.
-  let did = 0;
-  while (did < perAccount && queue.length > 0 && (typeof credits !== "number" || credits >= PV_GENERATION_COST)) {
+  // Phase 2: real generation flow. Inject pageWideRunGeneration per item,
+  // append a pv_gen_history entry on success, re-read credits from the
+  // navbar after each successful trigger, and bail to the next account
+  // after 2 consecutive failures (e.g. UI broke / account locked).
+  await setStatus("generating");
+  let did = 0, failures = 0;
+  while (did < perAccount && queue.length > 0 && credits >= PV_GENERATION_COST) {
     const item = queue[0];
-    log(`[gen-stub] would generate prompt #${(s[STATE_KEYS.GEN_DONE] || 0) + did + 1} on ${acc.email}`);
-    log(`[gen-stub]   prompt[0..80]: ${(item.prompt || "").slice(0, 80).replace(/\n/g, " ")}`);
-    log(`[gen-stub]   image: ${item.imageName || "<unnamed>"} (${(item.imageDataUri || "").length} bytes)`);
+    const idx = (s[STATE_KEYS.GEN_DONE] || 0) + did + 1;
+    const promptPreview = (item.prompt || "").slice(0, 80).replace(/\n/g, " ");
+    log(`[gen] #${idx} ${acc.email} <- ${item.imageName || "<unnamed>"} | ${promptPreview}`);
+
+    const res = await runGenerationInTab(loginRes.tab, item);
+    if (!res.ok) {
+      failures++;
+      log(`[gen] FAIL #${idx}: ${res.reason || "unknown"} (failures=${failures})`);
+      if (failures >= 2) {
+        log(`[gen] too many failures on ${acc.email}, switching account`);
+        break;
+      }
+      // Backoff and retry the SAME item (no shift, no decrement).
+      await new Promise((r) => setTimeout(r, 4000));
+      continue;
+    }
+
+    // Success: pop item, log to gen-history, update counters.
     queue.shift();
     did++;
+    failures = 0;
     if (typeof credits === "number") credits -= PV_GENERATION_COST;
+
+    try {
+      const histStore = await chrome.storage.local.get("pv_gen_history");
+      const hist = Array.isArray(histStore.pv_gen_history) ? histStore.pv_gen_history : [];
+      hist.push({
+        accountEmail: acc.email,
+        prompt: item.prompt,
+        imageName: item.imageName,
+        startedAt: res.startedAt || new Date().toISOString(),
+        confirmed: !!res.confirmed,
+      });
+      // Cap to prevent unbounded growth (Phase 3 will iterate this list).
+      while (hist.length > 5000) hist.shift();
+      await chrome.storage.local.set({ pv_gen_history: hist });
+    } catch (e) { log(`gen-history append failed: ${e.message}`); }
+
+    // Re-read credits from the navbar - cheap and authoritative.
+    try {
+      const out = await chrome.scripting.executeScript({
+        target: { tabId: loginRes.tab.id },
+        func: pageReadCredits,
+      });
+      const r = (out && out[0] && out[0].result) || {};
+      if (r.ok) credits = r.credits;
+    } catch (_) { /* keep estimated credits */ }
+
     await chrome.storage.local.set({
       [STATE_KEYS.GEN_QUEUE]: queue,
       [STATE_KEYS.GEN_DONE]: (s[STATE_KEYS.GEN_DONE] || 0) + did,
     });
+    await updateAccountInHistory(acc.email, { credits });
+
+    log(`[gen] OK #${idx} confirmed=${res.confirmed ? "yes" : "soft"} `
+      + `credits=${credits} queue=${queue.length}`);
+
+    // Small pause between generations on the same account to let the UI
+    // settle (the gallery card animation, the credits-deduction tick, ...).
+    await new Promise((r) => setTimeout(r, 3000));
   }
 
   await updateAccountInHistory(acc.email, { credits });
