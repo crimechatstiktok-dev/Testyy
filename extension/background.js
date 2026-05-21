@@ -26,6 +26,12 @@ const STATE_KEYS = {
   GEN_DONE: "pv_gen_done",          // count
   GEN_TOTAL: "pv_gen_total",        // count
   GEN_PER_ACCOUNT: "pv_gen_per_account",
+  // Phase 3 - downloads
+  DL_ACTIVE: "pv_dl_active",
+  DL_QUEUE: "pv_dl_queue",          // [emailAddr, ...] still to process
+  DL_DONE: "pv_dl_done",            // count of accounts processed
+  DL_TOTAL: "pv_dl_total",          // total accounts in this batch
+  DL_FILES_TOTAL: "pv_dl_files_total", // count of video files dispatched
 };
 
 // Per-generation cost (PixVerse V6 image-to-video at the listed quality).
@@ -1569,6 +1575,341 @@ async function generationsStep() {
   await chrome.alarms.create("pv-generations-step", { when: Date.now() + 30 * 1000 });
 }
 
+// =============================================================================
+// Phase 3 - Auto-Download of finished videos
+// =============================================================================
+//
+// After Phase 2 has triggered N generations across multiple accounts and
+// enough wall-clock time has passed for PixVerse's servers to finish the
+// renders (typically 5-15 min per video), Phase 3 walks through every
+// account that has at least one entry in pv_gen_history, logs in, navigates
+// to /creation/video (the gallery, "Erstellt" sub-tab), scrolls the masonry
+// grid until no new <video> elements load, extracts every video URL it can
+// see, and dispatches each one via chrome.downloads.download().
+//
+// Per-account dedupe: pv_accounts_history[i].downloadedVideoUrls keeps the
+// list of URLs we have already dispatched. On re-runs we only download URLs
+// that are not yet on this list, so the user can run Phase 3 repeatedly as
+// more renders finish without producing duplicate files.
+//
+// Loop control mirrors Phase 2: chrome.alarms ("pv-downloads-step") wakes
+// the service worker between accounts. State in chrome.storage.local under
+// pv_dl_active / pv_dl_queue / pv_dl_done / pv_dl_total / pv_dl_files_total.
+
+// Runs in the page on /creation/video. Waits for the gallery to hydrate,
+// scrolls to the bottom repeatedly to trigger lazy loading, then collects
+// the URLs of every <video> on the page. Returns:
+//   { ok: true, videos: [{url, poster?}], total: N, blobCount: N }
+// or { ok: false, reason }. Skips videos whose currentSrc is a blob: URL
+// (those use MSE and can't be downloaded directly via chrome.downloads).
+async function pageWideExtractGalleryVideos() {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  function isVisible(el) {
+    if (!el || !el.isConnected) return false;
+    const r = el.getBoundingClientRect();
+    if (r.width < 2 || r.height < 2) return false;
+    const cs = getComputedStyle(el);
+    return cs.visibility !== "hidden" && cs.display !== "none" && cs.opacity !== "0";
+  }
+
+  // 1) Wait up to 20s for the first <video> to render. The gallery is
+  //    React-rendered after hydration, so on cold load this is essential.
+  const start = Date.now();
+  while (Date.now() - start < 20000) {
+    if (document.querySelector("video")) break;
+    await sleep(500);
+  }
+  if (!document.querySelector("video")) {
+    return { ok: false, reason: "no video elements after 20s" };
+  }
+
+  // 2) If the "Erstellt" sub-tab exists and isn't active, click it. PixVerse
+  //    defaults to "Erstellt" anyway, but be defensive.
+  try {
+    const erstelltTab = Array.from(document.querySelectorAll("[role='tab']"))
+      .find((el) => {
+        if (!isVisible(el)) return false;
+        const t = (el.innerText || "").trim();
+        const first = t.split(/\s+/)[0];
+        return /^erstellt$|^created$/i.test(first) && t.length < 30;
+      });
+    if (erstelltTab) {
+      const sel = erstelltTab.getAttribute("aria-selected");
+      const hasDataActive = erstelltTab.hasAttribute("data-active");
+      if (sel !== "true" && !hasDataActive) {
+        erstelltTab.click();
+        await sleep(700);
+      }
+    }
+  } catch (_) {}
+
+  // 3) Scroll to bottom up to 30 times to trigger infinite-scroll loading.
+  //    Stop when the video count stops growing for two consecutive iterations.
+  let prevCount = 0;
+  let stableTicks = 0;
+  for (let i = 0; i < 30; i++) {
+    window.scrollTo(0, document.documentElement.scrollHeight);
+    // Some masonry implementations also need a small intermediate scroll
+    // event to dispatch IntersectionObserver. Nudge upward and back down.
+    await sleep(200);
+    window.scrollTo(0, document.documentElement.scrollHeight);
+    await sleep(900);
+    const count = document.querySelectorAll("video").length;
+    if (count === prevCount) {
+      stableTicks++;
+      if (stableTicks >= 2) break;
+    } else {
+      stableTicks = 0;
+      prevCount = count;
+    }
+  }
+
+  // 4) Collect URLs.
+  const videos = [];
+  let blobCount = 0;
+  const seen = new Set();
+  document.querySelectorAll("video").forEach((v) => {
+    let url = v.currentSrc || v.src || "";
+    if (!url) {
+      const src = v.querySelector("source");
+      if (src) url = src.src || src.getAttribute("src") || "";
+    }
+    if (!url) return;
+    if (url.startsWith("blob:")) { blobCount++; return; }
+    if (!/^https?:/i.test(url)) return;
+    if (seen.has(url)) return;
+    seen.add(url);
+    const poster = v.poster || v.getAttribute("poster") || "";
+    videos.push({ url, poster });
+  });
+
+  return { ok: true, videos, total: videos.length, blobCount };
+}
+
+// Wrapper: navigate the tab to /creation/video, then inject the gallery
+// extractor.
+async function extractGalleryVideosInTab(tab) {
+  let curPath = "";
+  try {
+    const cur = await chrome.tabs.get(tab.id);
+    curPath = new URL(cur.url).pathname;
+  } catch (_) {}
+  if (!/^\/creation\/video/.test(curPath)) {
+    await chrome.tabs.update(tab.id, { url: "https://app.pixverse.ai/creation/video" });
+    await waitForTabComplete(tab.id, 12000);
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+  try {
+    const out = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: pageWideExtractGalleryVideos,
+    });
+    return (out && out[0] && out[0].result) || { ok: false, reason: "no result" };
+  } catch (e) {
+    return { ok: false, reason: "executeScript: " + e.message };
+  }
+}
+
+// Build a download filename for a given account + URL. Format:
+//   pixverse/<email-localpart>/<basename-from-url>
+// chrome.downloads supports nested paths; the user's "Downloads/pixverse/..."
+// folder will be created automatically.
+function buildDownloadFilename(accountEmail, url) {
+  const localPart = String(accountEmail || "unknown").split("@")[0]
+    .replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 32) || "unknown";
+  let base = "video.mp4";
+  try {
+    const u = new URL(url);
+    const path = u.pathname || "";
+    const segs = path.split("/").filter(Boolean);
+    if (segs.length) base = segs[segs.length - 1];
+  } catch (_) {}
+  base = base.replace(/[^a-zA-Z0-9._-]/g, "_") || "video.mp4";
+  if (!/\.[a-z0-9]{2,5}$/i.test(base)) base += ".mp4";
+  return `pixverse/${localPart}/${base}`;
+}
+
+// Process ONE account: login, navigate to gallery, extract, download all
+// new URLs. Returns { ok, dispatched, skipped, total, reason? }.
+async function downloadsForAccount(account) {
+  log(`[dl] processing ${account.email}`);
+  await setStatus("logging-in");
+
+  // Force a clean session to make sure we're using THIS account's cookies.
+  await forceLogoutAndOpenRegister();
+  const loginRes = await loginToAccount(account);
+  if (!loginRes.ok) {
+    log(`[dl] login failed for ${account.email}: ${loginRes.error || "unknown"}`);
+    await updateAccountInHistory(account.email, { loginFailed: true });
+    return { ok: false, reason: "login failed", dispatched: 0, skipped: 0, total: 0 };
+  }
+
+  await setStatus("downloading");
+  const res = await extractGalleryVideosInTab(loginRes.tab);
+  if (!res.ok) {
+    log(`[dl] extract failed for ${account.email}: ${res.reason || "unknown"}`);
+    return { ok: false, reason: res.reason, dispatched: 0, skipped: 0, total: 0 };
+  }
+  log(`[dl] ${account.email}: found ${res.total} videos `
+    + `(blob-only: ${res.blobCount})`);
+
+  // Fetch the latest copy of the account record from history (downloadedVideoUrls
+  // may have been updated by a concurrent run).
+  const all = await getAccountsHistory();
+  const idx = all.findIndex((a) => (a.email || "").toLowerCase() === (account.email || "").toLowerCase());
+  const fresh = idx >= 0 ? all[idx] : account;
+  const already = new Set(Array.isArray(fresh.downloadedVideoUrls) ? fresh.downloadedVideoUrls : []);
+
+  let dispatched = 0, skipped = 0;
+  const newUrls = [];
+  for (const v of res.videos) {
+    if (already.has(v.url)) { skipped++; continue; }
+    const filename = buildDownloadFilename(account.email, v.url);
+    try {
+      await chrome.downloads.download({
+        url: v.url,
+        filename,
+        conflictAction: "uniquify",
+        saveAs: false,
+      });
+      dispatched++;
+      newUrls.push(v.url);
+      already.add(v.url);
+      // Small delay so chrome.downloads doesn't queue 50 at once and the
+      // network/disk stays sane.
+      await new Promise((r) => setTimeout(r, 250));
+    } catch (e) {
+      log(`[dl] download failed for ${v.url.slice(0, 80)}: ${e.message}`);
+    }
+  }
+
+  // Persist the dedupe list back into pv_accounts_history.
+  if (newUrls.length) {
+    const merged = Array.isArray(fresh.downloadedVideoUrls) ? fresh.downloadedVideoUrls.slice() : [];
+    for (const u of newUrls) if (!merged.includes(u)) merged.push(u);
+    while (merged.length > 5000) merged.shift();
+    await updateAccountInHistory(account.email, { downloadedVideoUrls: merged });
+  }
+
+  log(`[dl] ${account.email}: dispatched=${dispatched} skipped=${skipped} total=${res.total}`);
+
+  await setStatus("logging-out");
+  await tryUiLogout();
+
+  return { ok: true, dispatched, skipped, total: res.total };
+}
+
+// User-facing entry point. Builds the queue from unique pv_gen_history emails
+// (or, if pv_gen_history is empty, from pv_accounts_history), kicks off the
+// alarm-driven loop. opts.onlyEmails (optional) restricts to a subset.
+async function startDownloadsBatch(opts) {
+  opts = opts || {};
+  const histStore = await chrome.storage.local.get("pv_gen_history");
+  const gen = Array.isArray(histStore.pv_gen_history) ? histStore.pv_gen_history : [];
+
+  // Build candidate email list. Prefer accounts that had Phase 2 generations.
+  const seen = new Set();
+  const queue = [];
+  for (const e of gen) {
+    const m = (e.accountEmail || "").toLowerCase();
+    if (!m || seen.has(m)) continue;
+    seen.add(m);
+    queue.push(e.accountEmail);
+  }
+  // Fall back to all accounts when the gen-history is empty.
+  if (!queue.length) {
+    const all = await getAccountsHistory();
+    for (const a of all) {
+      const m = (a.email || "").toLowerCase();
+      if (!m || seen.has(m)) continue;
+      seen.add(m);
+      queue.push(a.email);
+    }
+  }
+
+  if (Array.isArray(opts.onlyEmails) && opts.onlyEmails.length) {
+    const allow = new Set(opts.onlyEmails.map((e) => e.toLowerCase()));
+    const filtered = queue.filter((e) => allow.has(e.toLowerCase()));
+    queue.length = 0;
+    queue.push(...filtered);
+  }
+
+  if (!queue.length) {
+    return { ok: false, error: "no candidate accounts (pv_gen_history empty and pv_accounts_history empty)" };
+  }
+
+  await chrome.storage.local.set({
+    [STATE_KEYS.DL_ACTIVE]: true,
+    [STATE_KEYS.DL_QUEUE]: queue,
+    [STATE_KEYS.DL_DONE]: 0,
+    [STATE_KEYS.DL_TOTAL]: queue.length,
+    [STATE_KEYS.DL_FILES_TOTAL]: 0,
+    [STATE_KEYS.LAST_LOG]: [],
+  });
+  log(`Downloads queued: ${queue.length} account(s)`);
+
+  await chrome.alarms.clear("pv-downloads-step");
+  await chrome.alarms.create("pv-downloads-step", { when: Date.now() + 100 });
+  return { ok: true, total: queue.length };
+}
+
+async function stopDownloads() {
+  await chrome.alarms.clear("pv-downloads-step");
+  await chrome.storage.local.set({ [STATE_KEYS.DL_ACTIVE]: false });
+  await setStatus("idle");
+  log("Downloads stopped");
+}
+
+// One step of the downloads loop. Pops the next email from pv_dl_queue,
+// downloads its videos, schedules the next step. If the queue is empty
+// after this step, we stop.
+async function downloadsStep() {
+  const s = await getState();
+  if (!s[STATE_KEYS.DL_ACTIVE]) {
+    log("alarm pv-downloads-step: dl not active, ignoring");
+    return;
+  }
+  const queue = Array.isArray(s[STATE_KEYS.DL_QUEUE]) ? s[STATE_KEYS.DL_QUEUE].slice() : [];
+  if (!queue.length) {
+    log("Downloads: queue empty, all done");
+    await stopDownloads();
+    return;
+  }
+
+  const email = queue[0];
+  const all = await getAccountsHistory();
+  const account = all.find((a) => (a.email || "").toLowerCase() === email.toLowerCase());
+
+  let filesTotal = s[STATE_KEYS.DL_FILES_TOTAL] || 0;
+  if (!account) {
+    log(`[dl] no credentials in history for ${email}, skipping`);
+  } else {
+    try {
+      const r = await downloadsForAccount(account);
+      if (r.ok) filesTotal += r.dispatched;
+    } catch (e) {
+      log(`[dl] error for ${email}: ${e.message}`);
+    }
+  }
+
+  // Pop the head of the queue, persist, schedule next.
+  queue.shift();
+  await chrome.storage.local.set({
+    [STATE_KEYS.DL_QUEUE]: queue,
+    [STATE_KEYS.DL_DONE]: (s[STATE_KEYS.DL_DONE] || 0) + 1,
+    [STATE_KEYS.DL_FILES_TOTAL]: filesTotal,
+  });
+
+  if (!queue.length) {
+    log(`Downloads: all ${s[STATE_KEYS.DL_TOTAL] || 0} accounts processed, ${filesTotal} files dispatched`);
+    await stopDownloads();
+    return;
+  }
+  log(`Downloads: ${queue.length} account(s) remaining. Next in 15s`);
+  await chrome.alarms.create("pv-downloads-step", { when: Date.now() + 15 * 1000 });
+}
+
 // -----------------------------------------------------------------------------
 // Inbox polling driven by chrome.alarms
 // -----------------------------------------------------------------------------
@@ -1577,6 +1918,12 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name === "pv-generations-step") {
     try { await generationsStep(); }
     catch (e) { log(`generationsStep error: ${e.message}`); }
+    return;
+  }
+  // Downloads queue tick (Phase 3).
+  if (alarm.name === "pv-downloads-step") {
+    try { await downloadsStep(); }
+    catch (e) { log(`downloadsStep error: ${e.message}`); }
     return;
   }
   // Wakes up to start the next iteration after the cool-down between runs.
@@ -1692,6 +2039,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
         case "PV_STOP_GENERATIONS": {
           await stopGenerations();
+          sendResponse({ ok: true });
+          return;
+        }
+        case "PV_START_DOWNLOADS": {
+          const r = await startDownloadsBatch(msg.opts || {});
+          sendResponse(r);
+          return;
+        }
+        case "PV_STOP_DOWNLOADS": {
+          await stopDownloads();
           sendResponse({ ok: true });
           return;
         }

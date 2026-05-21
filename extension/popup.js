@@ -46,6 +46,12 @@ async function refresh() {
   const gDone = s.pv_gen_done || 0;
   $("f-gen-progress").textContent = `${gDone} / ${gTotal}`;
 
+  // Download progress (Phase 3).
+  const dTotal = s.pv_dl_total || 0;
+  const dDone = s.pv_dl_done || 0;
+  const dFiles = s.pv_dl_files_total || 0;
+  $("f-dl-progress").textContent = `${dDone} / ${dTotal} Accounts \u00b7 ${dFiles} Dateien`;
+
   // History count.
   const hist = await chrome.storage.local.get("pv_accounts_history");
   const list = Array.isArray(hist.pv_accounts_history) ? hist.pv_accounts_history : [];
@@ -221,6 +227,23 @@ document.addEventListener("DOMContentLoaded", () => {
     refresh();
   });
 
+  $("btn-dl-start").addEventListener("click", async () => {
+    $("btn-dl-start").disabled = true;
+    try {
+      const r = await chrome.runtime.sendMessage({ type: "PV_START_DOWNLOADS", opts: {} });
+      if (!r || !r.ok) {
+        alert("Downloads-Start fehlgeschlagen: " + (r?.error || "unknown"));
+      }
+    } finally {
+      $("btn-dl-start").disabled = false;
+      refresh();
+    }
+  });
+  $("btn-dl-stop").addEventListener("click", async () => {
+    await chrome.runtime.sendMessage({ type: "PV_STOP_DOWNLOADS" });
+    refresh();
+  });
+
   $("btn-claim").addEventListener("click", async () => {
     const tabs = await chrome.tabs.query({ url: "https://app.pixverse.ai/*", active: true, currentWindow: true });
     let tab = tabs[0];
@@ -256,6 +279,7 @@ document.addEventListener("DOMContentLoaded", () => {
     await chrome.storage.local.set(keep);
     await chrome.runtime.sendMessage({ type: "PV_STOP" });
     await chrome.runtime.sendMessage({ type: "PV_STOP_GENERATIONS" });
+    await chrome.runtime.sendMessage({ type: "PV_STOP_DOWNLOADS" });
     refresh();
   });
 
