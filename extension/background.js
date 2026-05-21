@@ -406,59 +406,70 @@ async function clearPixverseWebStorage() {
     log("Web storage clear: no pixverse tab found yet");
     return;
   }
+  log(`Web storage clear: starting on ${tabs.length} tab(s)`);
 
   const totals = { ls: 0, ss: 0, idb: 0, sw: 0, caches: 0 };
 
   for (const t of tabs) {
     let results;
     try {
-      results = await chrome.scripting.executeScript({
-        target: { tabId: t.id },
-        // Async function -> executeScript awaits the returned Promise.
-        func: async () => {
-          const out = { ls: 0, ss: 0, idb: 0, sw: 0, caches: 0, errors: [] };
-          try {
-            out.ls = localStorage.length;
-            localStorage.clear();
-          } catch (e) { out.errors.push("ls:" + e.message); }
-          try {
-            out.ss = sessionStorage.length;
-            sessionStorage.clear();
-          } catch (e) { out.errors.push("ss:" + e.message); }
-          try {
-            if (typeof indexedDB.databases === "function") {
-              const dbs = await indexedDB.databases();
-              out.idb = dbs.length;
-              await Promise.all((dbs || []).map((db) =>
-                new Promise((resolve) => {
-                  try {
-                    const req = indexedDB.deleteDatabase(db.name);
-                    req.onsuccess = req.onerror = req.onblocked = () => resolve();
-                  } catch (_) { resolve(); }
-                })
-              ));
-            }
-          } catch (e) { out.errors.push("idb:" + e.message); }
-          try {
-            if (navigator.serviceWorker) {
-              const regs = await navigator.serviceWorker.getRegistrations();
-              for (const r of regs || []) {
-                try { await r.unregister(); out.sw++; } catch (_) {}
+      // Race executeScript against an 8-second timeout. Some tabs (e.g.
+      // a stale /login?redirectPath=... in the middle of a redirect loop)
+      // never resolve the injected promise, which used to wedge the whole
+      // generations loop forever. The timeout falls through to the next
+      // tab so we make progress.
+      results = await Promise.race([
+        chrome.scripting.executeScript({
+          target: { tabId: t.id },
+          // Async function -> executeScript awaits the returned Promise.
+          func: async () => {
+            const out = { ls: 0, ss: 0, idb: 0, sw: 0, caches: 0, errors: [] };
+            try {
+              out.ls = localStorage.length;
+              localStorage.clear();
+            } catch (e) { out.errors.push("ls:" + e.message); }
+            try {
+              out.ss = sessionStorage.length;
+              sessionStorage.clear();
+            } catch (e) { out.errors.push("ss:" + e.message); }
+            try {
+              if (typeof indexedDB.databases === "function") {
+                const dbs = await indexedDB.databases();
+                out.idb = dbs.length;
+                await Promise.all((dbs || []).map((db) =>
+                  new Promise((resolve) => {
+                    try {
+                      const req = indexedDB.deleteDatabase(db.name);
+                      req.onsuccess = req.onerror = req.onblocked = () => resolve();
+                    } catch (_) { resolve(); }
+                  })
+                ));
               }
-            }
-          } catch (e) { out.errors.push("sw:" + e.message); }
-          try {
-            if (self.caches && caches.keys) {
-              const ks = await caches.keys();
-              out.caches = ks.length;
-              await Promise.all(ks.map((k) => caches.delete(k).catch(() => {})));
-            }
-          } catch (e) { out.errors.push("caches:" + e.message); }
-          return out;
-        },
-      });
+            } catch (e) { out.errors.push("idb:" + e.message); }
+            try {
+              if (navigator.serviceWorker) {
+                const regs = await navigator.serviceWorker.getRegistrations();
+                for (const r of regs || []) {
+                  try { await r.unregister(); out.sw++; } catch (_) {}
+                }
+              }
+            } catch (e) { out.errors.push("sw:" + e.message); }
+            try {
+              if (self.caches && caches.keys) {
+                const ks = await caches.keys();
+                out.caches = ks.length;
+                await Promise.all(ks.map((k) => caches.delete(k).catch(() => {})));
+              }
+            } catch (e) { out.errors.push("caches:" + e.message); }
+            return out;
+          },
+        }),
+        new Promise((_, rej) => setTimeout(
+          () => rej(new Error("executeScript timed out after 8s")), 8000
+        )),
+      ]);
     } catch (e) {
-      log(`scripting on tab ${t.id} (${t.url}) failed: ${e.message}`);
+      log(`Web storage: tab ${t.id} (${(t.url || "").slice(0, 80)}) - ${e.message}`);
       continue;
     }
     const r = (results && results[0] && results[0].result) || {};
@@ -656,6 +667,21 @@ async function tryUiLogout() {
 // Wipe all auth surfaces, then navigate (or open) a tab to /register so the
 // SPA reboots completely and lands on the registration form.
 async function forceLogoutAndOpenRegister() {
+  // 0) Close any extra pixverse tabs first. Multiple stale tabs (e.g. one
+  //    on /login mid-redirect, one on /register) cause executeScript() to
+  //    hang in the storage clear and the whole loop wedges. Keep the first
+  //    one; close the rest.
+  const startTabs = await chrome.tabs.query({ url: "https://app.pixverse.ai/*" });
+  log(`forceLogoutAndOpenRegister: ${startTabs.length} pixverse tab(s) at start`);
+  if (startTabs.length > 1) {
+    for (let i = 1; i < startTabs.length; i++) {
+      try {
+        await chrome.tabs.remove(startTabs[i].id);
+        log(`  closed stale tab ${startTabs[i].id} (${(startTabs[i].url || "").slice(0, 80)})`);
+      } catch (_) {}
+    }
+  }
+
   // 1) Try the in-app logout button first - it's the most reliable way
   //    because the SPA's own logout code clears whatever it set.
   const uiOk = await tryUiLogout();
@@ -734,7 +760,10 @@ async function pickAccountWithCredits(minCredits) {
     return ok[0];
   }
   // Fall back: never-checked entries (treat optimistically). Newest first.
-  const unchecked = list.filter((a) => typeof a.credits !== "number");
+  // Skip ones we already know are broken (loginFailed:true) - the registration
+  // history contains lots of half-finished entries from mail.tm rate-limits
+  // where the email exists locally but was never fully registered on PixVerse.
+  const unchecked = list.filter((a) => typeof a.credits !== "number" && !a.loginFailed);
   unchecked.sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || ""));
   return unchecked[0] || null;
 }
@@ -1703,7 +1732,13 @@ async function generationsStep() {
   }
   await setStatus("picking-account");
 
-  const need = perAccount * PV_GENERATION_COST;
+  // Pick any account that can cover at least ONE generation. Previously this
+  // required perAccount * cost (e.g. 3 * 60 = 180), which excluded perfectly
+  // good accounts with 70-150 credits and made the picker fall back onto
+  // half-broken "unchecked" entries from earlier rate-limited registrations.
+  // The while loop below already iterates as long as `credits >= cost`, so
+  // we naturally stop and switch accounts once one is exhausted.
+  const need = PV_GENERATION_COST;
   let acc = await pickAccountWithCredits(need);
 
   if (!acc) {
