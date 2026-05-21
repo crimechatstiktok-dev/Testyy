@@ -889,9 +889,11 @@ async function loginToAccount(account) {
 // race-conditions with SPA navigation).
 //
 // Steps (top of the function, in order):
-//   1) If a "Bild" / "Image" tab exists, click it (the form is tab-gated on
-//      some PixVerse builds). No-op if already selected (PixVerse uses
-//      data-active="" attribute presence + aria-selected="true").
+//   1) Make sure we are on the Video tab in the top tablist. PixVerse
+//      defaults "/" to text-to-image generation (placeholder reads
+//      "Beschreiben Sie DAS BILD..."); the image-to-video form lives
+//      under the "Video" tab (placeholder "Beschreiben Sie DEN
+//      INHALT..."). Click the Video tab if it isn't already active.
 //   2) Locate the prompt textarea by placeholder regex /beschreib/i (matches
 //      the German placeholder "Beschreiben Sie den Inhalt, ..."). Fallback:
 //      first visible textarea.
@@ -903,15 +905,17 @@ async function loginToAccount(account) {
 //   5) Fill the prompt via the React-friendly setter (native value setter
 //      + bubbling input/change events).
 //   6) Settings:
-//        Audio toggle  -> ON
+//        Audio toggle  -> ON   (Ant Design role=switch, aria-checked=true)
 //        Multi-Aufnahme/Multi-shot toggle -> OFF
 //        Modell dropdown -> "PixVerse V6"
-//        Anzahl number stepper -> 1
+//        Anzahl number stepper -> 1 (best-effort, usually already 1)
 //      All located via DOM-distance to the matching label, never by class.
-//   7) Click "Erstellen"/"Create"/"Generate" with the full pointer/mouse
-//      sequence (same pattern claimReferralReward uses for the referral
-//      submit button).
-//   8) Soft-confirm: sleep 5.5s and check whether the create button became
+//   7) Click the "Erstellen" trigger. On PixVerse this is a clickable
+//      <div> (NOT a <button>), so we find the deepest element whose
+//      own text is "Erstellen" and walk up to the nearest clickable
+//      ancestor. Full pointer/mouse event sequence (matches the existing
+//      claimReferralReward pattern).
+//   8) Soft-confirm: sleep 5.5s and check whether the create trigger went
 //      disabled / its text changed / a generating-spinner appeared. We do
 //      NOT wait for the video to finish - that takes minutes. 5-10s is
 //      enough to know the request was accepted.
@@ -980,16 +984,23 @@ async function pageWideRunGeneration({ prompt, imageName, imageDataUri }) {
     return best;
   };
 
+  // Prefer the smallest (deepest) interactive match. Otherwise we'd pick
+  // wrapping containers - PixVerse's right-hand control panel renders
+  // model + count + create + cost as siblings whose common ancestor
+  // innerText reads "PixVerse V6\n1\nErstellen\n60", and we want the
+  // inner trigger ("PixVerse V6"), not the outer wrapper.
   const findClickableByText = (re) => {
     const list = document.querySelectorAll(
-      "button, a, [role='button'], [role='tab'], [role='option'], [role='menuitem']"
+      "button, a, [role='button'], [role='tab'], [role='option'], [role='menuitem'], [data-base-ui-click-trigger]"
     );
+    let best = null, bestLen = Infinity;
     for (const el of list) {
       if (!isVisible(el)) continue;
       const txt = (el.innerText || el.textContent || "").trim();
-      if (re.test(txt)) return el;
+      if (!re.test(txt)) continue;
+      if (txt.length < bestLen) { bestLen = txt.length; best = el; }
     }
-    return null;
+    return best;
   };
 
   // Pick the clickable matching clickRe with smallest DOM-distance to the
@@ -1094,33 +1105,36 @@ async function pageWideRunGeneration({ prompt, imageName, imageDataUri }) {
   };
 
   // ---------------------------------------------------------------------------
-  // 1) Click "Bild" / "Image" tab if present and not already selected.
+  // 1) Make sure we are on the Video form. On "/" PixVerse defaults to the
+  //    "Bild" (text-to-image) generator with placeholder "Beschreiben Sie
+  //    DAS BILD...". The video form (image-to-video) is reached by clicking
+  //    the "Video" tab in the top tablist; placeholder there reads
+  //    "Beschreiben Sie DEN INHALT...".
+  //
+  //    PixVerse renders tab labels with a sizing trick (z-1 absolute span
+  //    over a transparent placeholder span), so innerText is duplicated
+  //    e.g. "Video\nVideo". Match on the first word.
   // ---------------------------------------------------------------------------
   try {
-    const bildTab = await waitFor(() => {
-      const cands = Array.from(document.querySelectorAll(
-        "[role='tab'], button, a, div, span"
-      )).filter((el) => {
-        if (!isVisible(el)) return false;
-        const t = (el.innerText || "").trim();
-        return /^(bild|image|foto)$/i.test(t) && t.length <= 10;
-      });
+    const videoTab = await waitFor(() => {
+      const cands = Array.from(document.querySelectorAll("[role='tab']"))
+        .filter((el) => {
+          if (!isVisible(el)) return false;
+          const t = (el.innerText || "").trim();
+          const first = t.split(/\s+/)[0];
+          return /^video$/i.test(first) && t.length < 30;
+        });
       return cands[0] || null;
-    }, 4000, 250);
-    if (bildTab) {
-      const sel = bildTab.getAttribute("aria-selected");
-      // PixVerse uses data-active="" (attribute presence) for active tabs.
-      const hasDataActive = bildTab.hasAttribute("data-active");
-      const ds  = bildTab.dataset && (bildTab.dataset.state || "");
-      const cls = ((bildTab.className || "") + "").toLowerCase();
-      const alreadyActive = sel === "true" || hasDataActive ||
-        ds === "active" || /\bactive\b|\bselected\b/.test(cls);
-      if (!alreadyActive) {
-        clickFull(bildTab);
-        await sleep(700);
+    }, 8000, 300);
+    if (videoTab) {
+      const sel = videoTab.getAttribute("aria-selected");
+      const hasDataActive = videoTab.hasAttribute("data-active");
+      if (sel !== "true" && !hasDataActive) {
+        clickFull(videoTab);
+        await sleep(900);
       }
     }
-  } catch (_) { /* tab is optional */ }
+  } catch (_) { /* if no Video tab is found we hope the form is already there */ }
 
   // ---------------------------------------------------------------------------
   // 2) Prompt textarea.
@@ -1250,28 +1264,48 @@ async function pageWideRunGeneration({ prompt, imageName, imageDataUri }) {
   } catch (_) { /* non-fatal */ }
 
   // ---------------------------------------------------------------------------
-  // 8) Click "Erstellen". Wait up to 12s for it to be enabled (upload may
-  //    still be processing on the server side).
+  // 8) Click "Erstellen". On PixVerse this is a clickable <div> (NOT a
+  //    <button>) sitting next to the model selector and the credit cost,
+  //    e.g. the rendered group reads "PixVerse V6 | 1 | Erstellen | 60".
+  //    Strategy: find the deepest visible element whose own text is
+  //    exactly "Erstellen", then walk up the tree to the nearest
+  //    clickable ancestor (<button>, role=button, data-base-ui-click-
+  //    trigger, or anything with a non-negative tabIndex).
   // ---------------------------------------------------------------------------
   const createRe = /^\s*(erstellen|create|generate|generieren)\s*$/i;
-  const createBtn = await waitFor(() => {
-    const list = Array.from(document.querySelectorAll("button, [role='button']"));
-    for (const b of list) {
-      if (!isVisible(b)) continue;
-      const t = (b.innerText || b.textContent || "").trim();
-      if (!createRe.test(t)) continue;
-      if (b.disabled) continue;
-      if (b.getAttribute("aria-disabled") === "true") continue;
-      const cls = ((b.className || "") + "").toLowerCase();
-      if (cls.includes("cursor-not-allowed")) continue;
-      if (cls.includes("disabled") && !cls.includes("not-disabled")) continue;
-      return b;
+  const findCreateBtn = () => {
+    const txtEl = findDeepestLabel(createRe);
+    if (!txtEl) return null;
+    let target = txtEl;
+    for (let i = 0; i < 6 && target; i++) {
+      const role = target.getAttribute && target.getAttribute("role");
+      const isClickable =
+        target.tagName === "BUTTON" ||
+        role === "button" ||
+        target.hasAttribute("data-base-ui-click-trigger") ||
+        (typeof target.tabIndex === "number" && target.tabIndex >= 0);
+      if (isClickable) {
+        const ariaDisabled = target.getAttribute("aria-disabled") === "true";
+        if (target.disabled || ariaDisabled) return null;
+        const cls = ((target.className || "") + "").toLowerCase();
+        if (cls.includes("cursor-not-allowed")) return null;
+        if (/(^|[\s_-])disabled([\s_-]|$)/.test(cls)) return null;
+        // Heuristic: if the wrapper looks faded out, treat as disabled.
+        if (/\bopacity-(0|10|20|30|40|50)\b/.test(cls)) return null;
+        return target;
+      }
+      target = target.parentElement;
     }
-    return null;
-  }, 12000, 400);
+    // No clickable ancestor identified - fall back to the text element
+    // itself. PixVerse's click handler is attached via React event
+    // delegation on the document, so a synthesised click on the inner
+    // span/div still bubbles to the right listener.
+    return txtEl;
+  };
+  const createBtn = await waitFor(findCreateBtn, 12000, 400);
   if (!createBtn) {
     return {
-      ok: false, reason: "Erstellen button not enabled in time",
+      ok: false, reason: "Erstellen text/button not found in time",
       audio: audioRes, multi: multiRes, model: modelRes,
     };
   }
