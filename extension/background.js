@@ -890,7 +890,8 @@ async function loginToAccount(account) {
 //
 // Steps (top of the function, in order):
 //   1) If a "Bild" / "Image" tab exists, click it (the form is tab-gated on
-//      some PixVerse builds). No-op if already selected.
+//      some PixVerse builds). No-op if already selected (PixVerse uses
+//      data-active="" attribute presence + aria-selected="true").
 //   2) Locate the prompt textarea by placeholder regex /beschreib/i (matches
 //      the German placeholder "Beschreiben Sie den Inhalt, ..."). Fallback:
 //      first visible textarea.
@@ -1108,10 +1109,12 @@ async function pageWideRunGeneration({ prompt, imageName, imageDataUri }) {
     }, 4000, 250);
     if (bildTab) {
       const sel = bildTab.getAttribute("aria-selected");
+      // PixVerse uses data-active="" (attribute presence) for active tabs.
+      const hasDataActive = bildTab.hasAttribute("data-active");
       const ds  = bildTab.dataset && (bildTab.dataset.state || "");
       const cls = ((bildTab.className || "") + "").toLowerCase();
-      const alreadyActive = sel === "true" || ds === "active" ||
-        /\bactive\b|\bselected\b/.test(cls);
+      const alreadyActive = sel === "true" || hasDataActive ||
+        ds === "active" || /\bactive\b|\bselected\b/.test(cls);
       if (!alreadyActive) {
         clickFull(bildTab);
         await sleep(700);
@@ -1328,28 +1331,24 @@ async function runGenerationInTab(tab, item) {
     }
   };
 
-  // Are we already on a creation-capable page?
+  // The generation form lives on "/" (home/Startseite). /creation/video is
+  // the gallery (filter tabs Video/Bild/Mini-App/Gespeichert), confirmed
+  // from a sample of the page DOM, NOT the form. So we always navigate to
+  // "/" before injecting; we only skip the navigation if we're already
+  // there to avoid an unnecessary SPA reload.
   let curPath = "";
   try {
     const cur = await chrome.tabs.get(tab.id);
     curPath = new URL(cur.url).pathname;
   } catch (_) {}
 
-  if (curPath !== "/" && !/^\/creation\/video/.test(curPath)) {
+  if (curPath !== "/") {
     await chrome.tabs.update(tab.id, { url: "https://app.pixverse.ai/" });
     await waitForTabComplete(tab.id, 12000);
-    await new Promise((r) => setTimeout(r, 1800));
+    await new Promise((r) => setTimeout(r, 2000));
   }
 
-  let res = await inject();
-  if (!res.ok && /textarea not found|file input not found/i.test(res.reason || "")) {
-    log(`Generation: form not on "/" (${res.reason}), retrying on /creation/video`);
-    await chrome.tabs.update(tab.id, { url: "https://app.pixverse.ai/creation/video" });
-    await waitForTabComplete(tab.id, 12000);
-    await new Promise((r) => setTimeout(r, 2000));
-    res = await inject();
-  }
-  return res;
+  return await inject();
 }
 
 // -----------------------------------------------------------------------------
